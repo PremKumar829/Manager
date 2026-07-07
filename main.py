@@ -30,6 +30,7 @@ else:
 # Global Variables
 group_rules = "Group ke rules abhi set nahi hain."
 active_members = {}
+approval_delay = 5  # Default delay 5 seconds
 
 # --- DUMMY WEB SERVER (FOR RENDER HOSTING) ---
 class DummyHandler(BaseHTTPRequestHandler):
@@ -37,7 +38,7 @@ class DummyHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"Bot is running!")
+        self.wfile.write(b"Bot is successfully running on Render!")
 
 def run_dummy_server():
     port = int(os.environ.get("PORT", 8080))
@@ -69,7 +70,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "owner_info":
         await query.edit_message_text(f"Mere owner **{OWNER_NAME}** hain.", parse_mode='Markdown')
 
-# --- 2. TAG ALL FEATURE ---
+# --- 2. ADVANCED COMMANDS (/setdelay & /tagall) ---
+async def set_delay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global approval_delay
+    if not is_admin(update): return
+    try:
+        new_time = int(context.args[0])
+        approval_delay = new_time
+        await update.message.reply_text(f"✅ Auto-approval delay time ab **{new_time} seconds** set ho gaya hai.", parse_mode='Markdown')
+    except (IndexError, ValueError):
+        await update.message.reply_text("⚠️ Kaise use karein: `/setdelay <seconds>`\nExample: `/setdelay 10`", parse_mode='Markdown')
+
 async def tag_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     chat_id = update.message.chat_id
@@ -88,22 +99,21 @@ async def tag_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- 3. AUTO JOIN REQUEST ---
 async def join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await asyncio.sleep(5) 
+    await asyncio.sleep(approval_delay) 
     await update.chat_join_request.approve()
     try:
         await context.bot.send_message(chat_id=update.chat_join_request.from_user.id, text="Aapki group join request accept ho gayi hai. 🎉")
     except: pass
 
-# --- 4. SMART AI CHAT (FIXED) ---
+# --- 4. SMART AI CHAT ---
 async def get_ai_reply(prompt: str) -> str:
     if not GEMINI_API_KEY or not model:
-        return "❌ Bhai, Render mein GEMINI_API_KEY add nahi hai ya galat hai!"
+        return "❌ Bhai, API Key ya model set nahi hai!"
     try:
         system_prompt = "You are a casual telegram group member. Reply in short Hinglish. Tone should be friendly. Do not act like an AI."
         response = await asyncio.to_thread(model.generate_content, system_prompt + prompt)
         return response.text
     except Exception as e:
-        # Ab "Haan bhai" ki jagah asli error dikhega
         return f"❌ AI Crash Error: {str(e)}"
 
 async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -113,18 +123,20 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     chat_id = update.message.chat_id
 
+    # Save active members for /tagall
     if chat_type in ['group', 'supergroup'] and user.id != ADMIN_ID and not user.is_bot:
         if chat_id not in active_members: active_members[chat_id] = {}
         active_members[chat_id][user.id] = user.first_name
 
+    # Owner Query
     if any(keyword in text for keyword in ["owner kon", "admin kon", "malik kon"]):
         await update.message.reply_text(f"Mere owner **{OWNER_NAME}** hain. 😎", parse_mode='Markdown')
         return
 
+    # AI Trigger Logic
     bot_username = context.bot.username.lower() if context.bot.username else ""
     is_reply_to_bot = (update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id)
     
-    # AI Tabhi chalega jab DM ho, ya group mein koi bot ka naam le / reply kare
     if chat_type == 'private' or (chat_type in ['group', 'supergroup'] and (bot_username in text or is_reply_to_bot)):
         try:
             await context.bot.send_chat_action(chat_id=chat_id, action='typing')
@@ -137,12 +149,14 @@ def main():
     app = Application.builder().token(TOKEN).build()
     
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("tagall", tag_all)) 
+    app.add_handler(CommandHandler("tagall", tag_all))
+    app.add_handler(CommandHandler("setdelay", set_delay)) 
     
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(ChatJoinRequestHandler(join_request))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messages))
     
+    print("🚀 Bot deployed successfully! Fixed ModuleNotFoundError.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
