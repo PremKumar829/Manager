@@ -1,6 +1,6 @@
 import os
 import asyncio
-import google.generativeai as genai
+from google import genai
 from dotenv import load_dotenv
 from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -18,9 +18,8 @@ OWNER_NAME = "@PREMGUPTA2M"
 CHANNEL_LINK = "https://t.me/your_channel_link" # Apna link dalein
 GROUP_LINK = "https://t.me/your_group_link"     # Apna link dalein
 
-# AI Setup
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash') # Using latest fast model
+# Naya AI Setup (New Google GenAI Package)
+ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # Global Variables
 group_rules = "Group ke rules abhi set nahi hain. Admin /setrules command ka use karein."
@@ -133,8 +132,17 @@ async def join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_ai_reply(prompt: str) -> str:
     try:
         system_prompt = "You are a casual telegram group member. Reply in short Hinglish. Tone should be friendly. Do not act like an AI or bot. "
-        response = await asyncio.to_thread(model.generate_content, system_prompt + prompt)
-        return response.text
+        
+        # New Google GenAI API Call Logic
+        def fetch_response():
+            response = ai_client.models.generate_content(
+                model='gemini-1.5-flash',
+                contents=system_prompt + prompt
+            )
+            return response.text
+            
+        ai_reply = await asyncio.to_thread(fetch_response)
+        return ai_reply
     except Exception as e:
         return "Haan bhai, sab theek hai."
 
@@ -144,7 +152,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_type = update.message.chat.type
     user = update.message.from_user
 
-    # Anti-Link in Group (Sirf members ke liye, Admin allowed hai)
+    # Anti-Link in Group
     if chat_type in ['group', 'supergroup'] and user.id != ADMIN_ID:
         if any(link in text for link in ["http://", "https://", "t.me/", ".com", ".in"]):
             await update.message.delete()
@@ -189,7 +197,7 @@ def main():
     app.add_handler(ChatJoinRequestHandler(join_request))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messages))
     
-    print("🚀 Premium All-in-One Bot is running...")
+    print("🚀 Bot Fixed & Running Successfully...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
