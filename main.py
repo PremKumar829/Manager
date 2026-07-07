@@ -23,8 +23,8 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 OWNER_NAME = "@PREMGUPTA2M"
-CHANNEL_LINK = "https://t.me/your_channel_link"
-GROUP_LINK = "https://t.me/your_group_link"
+CHANNEL_LINK = "https://t.me/+Gouc7PsDosk4MTRl"
+GROUP_LINK = "https://t.me/+rSqVXbRig4BjOTc1"
 
 # Models to try in order. If the first one 404s / fails, bot auto-falls back
 # to the next one instead of dying. Update this list any time Google
@@ -60,6 +60,7 @@ warnings = defaultdict(lambda: defaultdict(int))  # chat_id -> {user_id: count}
 message_log = defaultdict(lambda: defaultdict(lambda: deque(maxlen=FLOOD_MSG_LIMIT + 1)))
 known_chats = set()                       # for /broadcast
 approval_settings = defaultdict(lambda: {"enabled": True, "delay": 5})  # chat_id -> settings
+chat_history = defaultdict(lambda: deque(maxlen=30))  # chat_id -> recent messages, used so AI matches group's style
 
 TAG_BATCH_SIZE = 5           # mentions per tag message (keeps it readable)
 TAG_BATCH_DELAY = 1.5        # seconds between batches (avoid Telegram rate limits)
@@ -119,13 +120,23 @@ def get_target_user(update: Update):
 # ============================================================
 # AI REPLY WITH FALLBACK CHAIN
 # ============================================================
-async def get_ai_reply(prompt: str) -> str:
+async def get_ai_reply(prompt: str, style_context: list = None) -> str:
     if not ai_client:
         return "❌ Bhai, GEMINI_API_KEY set nahi hai!"
+
+    style_hint = ""
+    if style_context:
+        sample = "\n".join(style_context[-10:])
+        style_hint = (
+            "\n\nHere are some recent messages from this group/chat — match their "
+            "language style, tone, and slang when you reply (don't quote them back, "
+            "just absorb the vibe):\n" + sample
+        )
 
     system_prompt = (
         "You are a casual telegram group member. Reply in short Hinglish. "
         "Tone should be friendly. Do not act like an AI."
+        + style_hint
     )
 
     last_error = None
@@ -620,6 +631,10 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_type in ["group", "supergroup"] and user.id != ADMIN_ID and not user.is_bot:
         active_members[chat_id][user.id] = user.first_name
 
+    # Remember recent messages so the AI can match this group's tone/style
+    if not user.is_bot:
+        chat_history[chat_id].append(update.message.text)
+
     # Anti-flood (skip for admins)
     if chat_type in ["group", "supergroup"] and not await is_group_admin(update, context):
         if await check_flood(update, context):
@@ -637,6 +652,20 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 log.warning(f"Anti-link cleanup failed: {e}")
             return
 
+    # Group / channel link requests — always answer these, private or group
+    if "link" in text:
+        wants_channel = "channel" in text
+        wants_group = "group" in text
+        if wants_channel and not wants_group:
+            await update.message.reply_text(f"📢 Channel link: {CHANNEL_LINK}")
+            return
+        if wants_group and not wants_channel:
+            await update.message.reply_text(f"👥 Group link: {GROUP_LINK}")
+            return
+        if wants_channel or wants_group or any(k in text for k in ["link do", "link bhejo", "link chahiye"]):
+            await update.message.reply_text(f"👥 Group: {GROUP_LINK}\n📢 Channel: {CHANNEL_LINK}")
+            return
+
     # Owner query
     if any(keyword in text for keyword in ["owner kon", "admin kon", "malik kon"]):
         await update.message.reply_text(f"Mere owner **{OWNER_NAME}** hain. 😎", parse_mode="Markdown")
@@ -652,7 +681,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_type == "private" or (chat_type in ["group", "supergroup"] and (bot_username in text or is_reply_to_bot)):
         try:
             await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-            ai_reply = await get_ai_reply(update.message.text)
+            ai_reply = await get_ai_reply(update.message.text, style_context=list(chat_history[chat_id]))
             await update.message.reply_text(ai_reply)
         except Exception as e:
             log.error(f"AI reply failed: {e}")
