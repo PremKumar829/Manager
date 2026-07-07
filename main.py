@@ -1,5 +1,7 @@
 import os
 import asyncio
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from google import genai
 from dotenv import load_dotenv
 from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
@@ -24,18 +26,34 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 # Global Variables
 group_rules = "Group ke rules abhi set nahi hain. Admin /setrules command ka use karein."
 
+# --- DUMMY WEB SERVER (FOR RENDER HOSTING) ---
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Bot is successfully running on Render!")
+
+def run_dummy_server():
+    port = int(os.environ.get("PORT", 8080)) # Render automatically PORT dega
+    server = HTTPServer(('0.0.0.0', port), DummyHandler)
+    server.serve_forever()
+
 # --- 1. START & BUTTONS (DM FEATURES) ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Personal/Group start menu with premium buttons"""
-    user_name = update.effective_user.first_name
-    text = f"Hello {user_name}! 👋\n\nMain ek advanced AI Group Manager bot hoon."
-    
-    keyboard = [
-        [InlineKeyboardButton("📢 Channel", url=CHANNEL_LINK), InlineKeyboardButton("👥 Group", url=GROUP_LINK)],
-        [InlineKeyboardButton("👨‍💻 Owner / Admin", callback_data="owner_info")]
-    ]
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    try:
+        user_name = update.effective_user.first_name
+        text = f"Hello {user_name}! 👋\n\nMain ek advanced AI Group Manager bot hoon."
+        
+        keyboard = [
+            [InlineKeyboardButton("📢 Channel", url=CHANNEL_LINK), InlineKeyboardButton("👥 Group", url=GROUP_LINK)],
+            [InlineKeyboardButton("👨‍💻 Owner / Admin", callback_data="owner_info")]
+        ]
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    except Exception as e:
+        print(f"Start command error: {e}") # Agar user message delete kar de toh error handle karega
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles inline button clicks"""
@@ -132,8 +150,6 @@ async def join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_ai_reply(prompt: str) -> str:
     try:
         system_prompt = "You are a casual telegram group member. Reply in short Hinglish. Tone should be friendly. Do not act like an AI or bot. "
-        
-        # New Google GenAI API Call Logic
         def fetch_response():
             response = ai_client.models.generate_content(
                 model='gemini-1.5-flash',
@@ -155,10 +171,13 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Anti-Link in Group
     if chat_type in ['group', 'supergroup'] and user.id != ADMIN_ID:
         if any(link in text for link in ["http://", "https://", "t.me/", ".com", ".in"]):
-            await update.message.delete()
-            warning = await update.message.reply_text(f"⚠️ {user.first_name}, yahan links bhejna allowed nahi hai!")
-            await asyncio.sleep(5)
-            await warning.delete()
+            try:
+                await update.message.delete()
+                warning = await update.message.reply_text(f"⚠️ {user.first_name}, yahan links bhejna allowed nahi hai!")
+                await asyncio.sleep(5)
+                await warning.delete()
+            except:
+                pass
             return
 
     # Owner Info Detection
@@ -171,14 +190,20 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_reply_to_bot = (update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id)
     
     if chat_type == 'private' or (chat_type in ['group', 'supergroup'] and (bot_username in text or is_reply_to_bot)):
-        await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
-        ai_reply = await get_ai_reply(update.message.text)
-        await update.message.reply_text(ai_reply)
+        try:
+            await context.bot.send_chat_action(chat_id=update.message.chat_id, action='typing')
+            ai_reply = await get_ai_reply(update.message.text)
+            await update.message.reply_text(ai_reply)
+        except:
+            pass
 
 # --- MAIN FUNCTION ---
 
 def main():
-    # Build App
+    # 1. Start Dummy Web Server in background thread for Render
+    threading.Thread(target=run_dummy_server, daemon=True).start()
+    
+    # 2. Build App
     app = Application.builder().token(TOKEN).build()
     
     # Register Commands
@@ -197,7 +222,7 @@ def main():
     app.add_handler(ChatJoinRequestHandler(join_request))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messages))
     
-    print("🚀 Bot Fixed & Running Successfully...")
+    print("🚀 Premium All-in-One Bot is running with Render Web Server trick...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
