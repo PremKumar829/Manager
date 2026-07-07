@@ -17,13 +17,14 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 OWNER_NAME = "@PREMGUPTA2M"
-CHANNEL_LINK = "https://t.me/your_channel_link" 
-GROUP_LINK = "https://t.me/your_group_link"     
+CHANNEL_LINK = "https://t.me/+Gouc7PsDosk4MTRl" # Yahan apna link dalein
+GROUP_LINK = "https://t.me/+rSqVXbRig4BjOTc1"     # Yahan apna link dalein
 
-# AI Setup (Robust Checking)
+# AI Setup (Robust Checking & Stable Model Fix)
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    # 404 Error fix: Using gemini-pro instead of gemini-1.5-flash for older SDK compatibility
+    model = genai.GenerativeModel('gemini-pro')
 else:
     model = None
 
@@ -128,6 +129,17 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if chat_id not in active_members: active_members[chat_id] = {}
         active_members[chat_id][user.id] = user.first_name
 
+    # Anti-link setup (delete links sent by non-admins)
+    if chat_type in ['group', 'supergroup'] and not is_admin(update):
+        if any(link in text for link in ["http://", "https://", "t.me/", ".com", ".in"]):
+            try:
+                await update.message.delete()
+                warning = await update.message.reply_text(f"⚠️ {user.first_name}, yahan links allowed nahi hai!")
+                await asyncio.sleep(5)
+                await warning.delete()
+            except: pass
+            return
+
     # Owner Query
     if any(keyword in text for keyword in ["owner kon", "admin kon", "malik kon"]):
         await update.message.reply_text(f"Mere owner **{OWNER_NAME}** hain. 😎", parse_mode='Markdown')
@@ -137,6 +149,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_username = context.bot.username.lower() if context.bot.username else ""
     is_reply_to_bot = (update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id)
     
+    # Private chat ya Group mein mention/reply hone par AI ka jawab
     if chat_type == 'private' or (chat_type in ['group', 'supergroup'] and (bot_username in text or is_reply_to_bot)):
         try:
             await context.bot.send_chat_action(chat_id=chat_id, action='typing')
@@ -145,18 +158,22 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
 
 def main():
+    # Render ke liye dummy server background mein start karo
     threading.Thread(target=run_dummy_server, daemon=True).start()
+    
     app = Application.builder().token(TOKEN).build()
     
+    # Basic & Advanced Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("tagall", tag_all))
     app.add_handler(CommandHandler("setdelay", set_delay)) 
     
+    # Automations & Callbacks
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(ChatJoinRequestHandler(join_request))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messages))
     
-    print("🚀 Bot deployed successfully! Fixed ModuleNotFoundError.")
+    print("🚀 Final Bot deployed successfully with stable gemini-pro model!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
