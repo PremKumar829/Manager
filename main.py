@@ -2,7 +2,9 @@ import os
 import time
 import asyncio
 import logging
+import tempfile
 import threading
+import requests
 from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -67,6 +69,9 @@ message_count = defaultdict(lambda: defaultdict(int))  # chat_id -> {user_id: to
 slow_mode = defaultdict(int)               # chat_id -> seconds between messages per user (0 = off)
 last_message_time = defaultdict(dict)      # chat_id -> {user_id: last message timestamp}
 link_whitelist = defaultdict(set)          # chat_id -> extra allowed link substrings
+sticker_replies = defaultdict(dict)        # chat_id -> {keyword: sticker_file_id}
+discord_webhooks = {}                      # chat_id -> Discord webhook URL for relaying messages
+channel_links = defaultdict(set)           # channel_chat_id -> set of group_chat_ids to auto-forward into
 
 TAG_BATCH_SIZE = 5           # mentions per tag message (keeps it readable)
 TAG_BATCH_DELAY = 1.5        # seconds between batches (avoid Telegram rate limits)
@@ -195,7 +200,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /start — Welcome menu\n"
         "• /rules — Show group rules\n"
         "• /stats — Group activity stats\n"
-        "• /topmembers — Most active members leaderboard\n\n"
+        "• /topmembers — Most active members leaderboard\n"
+        "• Send a voice note (or reply to bot with one) — I'll transcribe it 🎙️\n\n"
         "*Admin only*\n"
         "• /setrules <text> — Set group rules\n"
         "• /setwelcome <msg> — Custom welcome message (use {name})\n"
@@ -204,6 +210,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /slowmode <seconds> — Limit messages per user (0 = off)\n"
         "• /addbadword, /removebadword, /badwords — Manage word filter\n"
         "• /allowlink, /disallowlink, /listlinks — Manage link whitelist\n"
+        "• /addstickerreact (reply to sticker) <keyword> — Auto-react with sticker\n"
+        "• /removestickerreact <keyword> — Remove sticker reaction\n"
+        "• /setdiscordwebhook <url> / /removediscordwebhook — Mirror chat to Discord\n"
+        "• /linkchannel <channel_id> / /unlinkchannel — Auto-forward channel posts here\n"
         "• /tagall <msg> — Tag all known members (batched)\n"
         "• /tagadmins <msg> — Tag all group admins\n"
         "• /call (reply) or /call @username <msg> — Ping one member\n"
@@ -638,6 +648,178 @@ async def list_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
+# ============================================================
+# VOICE MESSAGE TRANSCRIPTION
+# ============================================================
+async def transcribe_voice(file_path: str) -> str:
+    if not ai_client:
+        return "❌ GEMINI_API_KEY set nahi hai, transcription possible nahi."
+
+    def fetch():
+        uploaded = ai_client.files.upload(file=file_path)
+        response = ai_client.models.generate_content(
+            model=GEMINI_MODEL_CHAIN[0],
+            contents=[
+                "Transcribe this voice message. Reply with ONLY the transcription "
+                "in the original spoken language, no extra commentary.",
+                uploaded
+            ]
+        )
+        return response.text
+
+    try:
+        return await asyncio.to_thread(fetch)
+    except Exception as e:
+        log.warning(f"Voice transcription failed: {e}")
+        return f"❌ Transcription failed: {e}"
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.voice:
+        return
+    chat_type = update.message.chat.type
+    is_reply_to_bot = (
+        update.message.reply_to_message
+        and update.message.reply_to_message.from_user
+        and update.message.reply_to_message.from_user.id == context.bot.id
+    )
+    # In groups only transcribe when the voice note replies to the bot;
+    # in private chat, always transcribe.
+    if chat_type in ["group", "supergroup"] and not is_reply_to_bot:
+        return
+
+    tmp_path = None
+    try:
+        await context.bot.send_chat_action(chat_id=update.message.chat_id, action="typing")
+        voice_file = await update.message.voice.get_file()
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+            tmp_path = tmp.name
+        await voice_file.download_to_drive(tmp_path)
+        transcription = await transcribe_voice(tmp_path)
+        await update.message.reply_text(f"🎙️ *Transcription:*\n{transcription}", parse_mode="Markdown")
+    except Exception as e:
+        log.error(f"Voice handling failed: {e}")
+        await update.message.reply_text("❌ Voice message process nahi ho paya.")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+# ============================================================
+# STICKER AUTO-REACT
+# ============================================================
+async def add_sticker_react(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_group_admin(update, context):
+        return
+    if not context.args or not update.message.reply_to_message or not update.message.reply_to_message.sticker:
+        await update.message.reply_text(
+            "⚠️ Reply to a sticker with `/addstickerreact <keyword>`",
+            parse_mode="Markdown"
+        )
+        return
+    chat_id = update.message.chat_id
+    keyword = " ".join(context.args).lower()
+    file_id = update.message.reply_to_message.sticker.file_id
+    sticker_replies[chat_id][keyword] = file_id
+    await update.message.reply_text(f"✅ Ab jab bhi \"{keyword}\" bola jayega, ye sticker bhej dunga.")
+
+
+async def remove_sticker_react(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_group_admin(update, context):
+        return
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: `/removestickerreact <keyword>`", parse_mode="Markdown")
+        return
+    chat_id = update.message.chat_id
+    keyword = " ".join(context.args).lower()
+    sticker_replies[chat_id].pop(keyword, None)
+    await update.message.reply_text(f"✅ \"{keyword}\" sticker-react removed.")
+
+
+# ============================================================
+# MULTI-PLATFORM: DISCORD RELAY
+# ============================================================
+def relay_to_discord(chat_id: int, author: str, text: str):
+    """Blocking HTTP call — always run this via asyncio.to_thread so it
+    never stalls the bot's event loop."""
+    webhook_url = discord_webhooks.get(chat_id)
+    if not webhook_url:
+        return
+    try:
+        requests.post(webhook_url, json={"content": f"**{author}**: {text}"}, timeout=5)
+    except Exception as e:
+        log.warning(f"Discord relay failed: {e}")
+
+
+async def set_discord_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_group_admin(update, context):
+        return
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: `/setdiscordwebhook <url>`", parse_mode="Markdown")
+        return
+    chat_id = update.message.chat_id
+    discord_webhooks[chat_id] = context.args[0]
+    await update.message.reply_text("✅ Discord relay set! Group messages will now mirror to that Discord channel.")
+
+
+async def remove_discord_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_group_admin(update, context):
+        return
+    discord_webhooks.pop(update.message.chat_id, None)
+    await update.message.reply_text("✅ Discord relay removed.")
+
+
+# ============================================================
+# MULTI-PLATFORM: CHANNEL → GROUP AUTO-FORWARD
+# ============================================================
+async def link_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Run inside the group. Bot must be admin in both the channel and the group."""
+    if not await is_group_admin(update, context):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Usage: `/linkchannel <channel_id>` (channel_id looks like -1001234567890)",
+            parse_mode="Markdown"
+        )
+        return
+    try:
+        channel_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ Channel ID must be numeric, e.g. `-1001234567890`.", parse_mode="Markdown")
+        return
+    channel_links[channel_id].add(update.message.chat_id)
+    await update.message.reply_text(f"✅ Posts from channel {channel_id} will now auto-forward to this group.")
+
+
+async def unlink_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_group_admin(update, context):
+        return
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: `/unlinkchannel <channel_id>`", parse_mode="Markdown")
+        return
+    try:
+        channel_id = int(context.args[0])
+    except ValueError:
+        return
+    channel_links[channel_id].discard(update.message.chat_id)
+    await update.message.reply_text("✅ Unlinked.")
+
+
+async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.channel_post:
+        return
+    channel_id = update.channel_post.chat.id
+    for group_id in channel_links.get(channel_id, set()):
+        try:
+            await context.bot.forward_message(
+                chat_id=group_id,
+                from_chat_id=channel_id,
+                message_id=update.channel_post.message_id
+            )
+        except Exception as e:
+            log.warning(f"Channel forward to {group_id} failed: {e}")
+
+
 async def kick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_group_admin(update, context):
         return
@@ -855,6 +1037,10 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     log.warning(f"Anti-link cleanup failed: {e}")
                 return
 
+    # Multi-platform: mirror this message to Discord if a webhook is set for this chat
+    if chat_type in ["group", "supergroup"] and chat_id in discord_webhooks:
+        asyncio.create_task(asyncio.to_thread(relay_to_discord, chat_id, user.first_name, update.message.text))
+
     # Group / channel link requests — always answer these, private or group
     if "link" in text:
         wants_channel = "channel" in text
@@ -868,6 +1054,16 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if wants_channel or wants_group or any(k in text for k in ["link do", "link bhejo", "link chahiye"]):
             await update.message.reply_text(f"👥 Group: {GROUP_LINK}\n📢 Channel: {CHANNEL_LINK}")
             return
+
+    # Sticker auto-react
+    if chat_type in ["group", "supergroup"] and sticker_replies.get(chat_id):
+        for keyword, file_id in sticker_replies[chat_id].items():
+            if keyword in text:
+                try:
+                    await context.bot.send_sticker(chat_id=chat_id, sticker=file_id)
+                except Exception as e:
+                    log.warning(f"Sticker react failed: {e}")
+                return
 
     # Owner query
     if any(keyword in text for keyword in ["owner kon", "admin kon", "malik kon"]):
@@ -933,6 +1129,12 @@ def main():
     app.add_handler(CommandHandler("allowlink", allow_link))
     app.add_handler(CommandHandler("disallowlink", disallow_link))
     app.add_handler(CommandHandler("listlinks", list_links))
+    app.add_handler(CommandHandler("addstickerreact", add_sticker_react))
+    app.add_handler(CommandHandler("removestickerreact", remove_sticker_react))
+    app.add_handler(CommandHandler("setdiscordwebhook", set_discord_webhook))
+    app.add_handler(CommandHandler("removediscordwebhook", remove_discord_webhook))
+    app.add_handler(CommandHandler("linkchannel", link_channel))
+    app.add_handler(CommandHandler("unlinkchannel", unlink_channel))
     app.add_handler(CommandHandler("tagall", tag_all))
     app.add_handler(CommandHandler("tagadmins", tag_admins))
     app.add_handler(CommandHandler("call", call_user))
@@ -952,6 +1154,8 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(ChatJoinRequestHandler(join_request))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, handle_channel_post))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messages))
 
     log.info("🚀 Prime X Assistant deployed successfully!")
