@@ -61,6 +61,12 @@ message_log = defaultdict(lambda: defaultdict(lambda: deque(maxlen=FLOOD_MSG_LIM
 known_chats = set()                       # for /broadcast
 approval_settings = defaultdict(lambda: {"enabled": True, "delay": 5})  # chat_id -> settings
 chat_history = defaultdict(lambda: deque(maxlen=30))  # chat_id -> recent messages, used so AI matches group's style
+custom_welcome = {}                        # chat_id -> welcome template (use {name} placeholder)
+bad_words = defaultdict(set)               # chat_id -> set of banned words/phrases
+message_count = defaultdict(lambda: defaultdict(int))  # chat_id -> {user_id: total messages} for leaderboard
+slow_mode = defaultdict(int)               # chat_id -> seconds between messages per user (0 = off)
+last_message_time = defaultdict(dict)      # chat_id -> {user_id: last message timestamp}
+link_whitelist = defaultdict(set)          # chat_id -> extra allowed link substrings
 
 TAG_BATCH_SIZE = 5           # mentions per tag message (keeps it readable)
 TAG_BATCH_DELAY = 1.5        # seconds between batches (avoid Telegram rate limits)
@@ -188,11 +194,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*General*\n"
         "• /start — Welcome menu\n"
         "• /rules — Show group rules\n"
-        "• /stats — Group activity stats\n\n"
+        "• /stats — Group activity stats\n"
+        "• /topmembers — Most active members leaderboard\n\n"
         "*Admin only*\n"
         "• /setrules <text> — Set group rules\n"
+        "• /setwelcome <msg> — Custom welcome message (use {name})\n"
         "• /autoapprove on|off — Toggle join-request auto-approval\n"
         "• /setdelay <seconds> — Join-request auto-approve delay\n"
+        "• /slowmode <seconds> — Limit messages per user (0 = off)\n"
+        "• /addbadword, /removebadword, /badwords — Manage word filter\n"
+        "• /allowlink, /disallowlink, /listlinks — Manage link whitelist\n"
         "• /tagall <msg> — Tag all known members (batched)\n"
         "• /tagadmins <msg> — Tag all group admins\n"
         "• /call (reply) or /call @username <msg> — Ping one member\n"
@@ -376,6 +387,25 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 # MODERATION COMMANDS
 # ============================================================
+async def apply_warning(chat_id: int, target_user, context: ContextTypes.DEFAULT_TYPE, reason: str = "") -> str:
+    """Shared warning logic used by /warn and automated filters (bad words, etc)."""
+    warnings[chat_id][target_user.id] += 1
+    count = warnings[chat_id][target_user.id]
+    suffix = f" ({reason})" if reason else ""
+
+    if count >= MAX_WARNINGS:
+        try:
+            await context.bot.restrict_chat_member(
+                chat_id, target_user.id,
+                permissions=ChatPermissions(can_send_messages=False)
+            )
+            warnings[chat_id][target_user.id] = 0
+            return f"🔇 {target_user.first_name} ko {MAX_WARNINGS} warnings ke baad mute kar diya gaya hai.{suffix}"
+        except Exception as e:
+            return f"⚠️ Mute failed: {e}"
+    return f"⚠️ {target_user.first_name} ko warning {count}/{MAX_WARNINGS} mil gayi hai.{suffix}"
+
+
 async def warn_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_group_admin(update, context):
         return
@@ -385,25 +415,8 @@ async def warn_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.message.chat_id
-    warnings[chat_id][target.id] += 1
-    count = warnings[chat_id][target.id]
-
-    if count >= MAX_WARNINGS:
-        try:
-            await context.bot.restrict_chat_member(
-                chat_id, target.id,
-                permissions=ChatPermissions(can_send_messages=False)
-            )
-            await update.message.reply_text(
-                f"🔇 {target.first_name} ko {MAX_WARNINGS} warnings ke baad mute kar diya gaya hai."
-            )
-            warnings[chat_id][target.id] = 0
-        except Exception as e:
-            await update.message.reply_text(f"⚠️ Mute failed: {e}")
-    else:
-        await update.message.reply_text(
-            f"⚠️ {target.first_name} ko warning {count}/{MAX_WARNINGS} mil gayi hai."
-        )
+    result = await apply_warning(chat_id, target, context)
+    await update.message.reply_text(result)
 
 
 async def unwarn_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -468,6 +481,161 @@ async def unmute_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🔊 {target.first_name} unmuted.")
     except Exception as e:
         await update.message.reply_text(f"⚠️ Unmute failed: {e}")
+
+
+# ============================================================
+# BAD WORD FILTER
+# ============================================================
+async def add_bad_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_group_admin(update, context):
+        return
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: `/addbadword <word>`", parse_mode="Markdown")
+        return
+    chat_id = update.message.chat_id
+    word = " ".join(context.args).lower()
+    bad_words[chat_id].add(word)
+    await update.message.reply_text(f"✅ Added \"{word}\" to the filter list.")
+
+
+async def remove_bad_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_group_admin(update, context):
+        return
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: `/removebadword <word>`", parse_mode="Markdown")
+        return
+    chat_id = update.message.chat_id
+    word = " ".join(context.args).lower()
+    bad_words[chat_id].discard(word)
+    await update.message.reply_text(f"✅ Removed \"{word}\" from the filter list.")
+
+
+async def list_bad_words(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_group_admin(update, context):
+        return
+    chat_id = update.message.chat_id
+    words = bad_words.get(chat_id, set())
+    if not words:
+        await update.message.reply_text("📝 No filtered words set for this group.")
+        return
+    await update.message.reply_text("📝 *Filtered words:*\n" + ", ".join(sorted(words)), parse_mode="Markdown")
+
+
+# ============================================================
+# SLOW MODE
+# ============================================================
+async def set_slowmode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_group_admin(update, context):
+        return
+    chat_id = update.message.chat_id
+    try:
+        seconds = int(context.args[0])
+        if seconds < 0:
+            raise ValueError
+        slow_mode[chat_id] = seconds
+        if seconds == 0:
+            await update.message.reply_text("✅ Slow mode disabled.")
+        else:
+            await update.message.reply_text(f"🐢 Slow mode set: 1 message every {seconds} second(s) per user.")
+    except (IndexError, ValueError):
+        await update.message.reply_text(
+            "⚠️ Usage: `/slowmode <seconds>` (0 to disable)\nExample: `/slowmode 15`",
+            parse_mode="Markdown"
+        )
+
+
+# ============================================================
+# WELCOME MESSAGE
+# ============================================================
+async def set_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_group_admin(update, context):
+        return
+    chat_id = update.message.chat_id
+    text = " ".join(context.args)
+    if not text:
+        await update.message.reply_text(
+            "⚠️ Usage: `/setwelcome <message>` — use `{name}` for the member's name.\n"
+            "Example: `/setwelcome Welcome {name}! Read the pinned rules 🎉`",
+            parse_mode="Markdown"
+        )
+        return
+    custom_welcome[chat_id] = text
+    await update.message.reply_text("✅ Welcome message updated!")
+
+
+async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    for member in update.message.new_chat_members:
+        if member.is_bot:
+            continue
+        template = custom_welcome.get(
+            chat_id,
+            "🎉 Welcome {name}! Glad to have you here.\n\nType /rules to see the group rules, and /help for what I can do."
+        )
+        text = template.replace("{name}", member.first_name)
+        try:
+            await update.message.reply_text(text)
+        except Exception as e:
+            log.warning(f"Welcome message failed: {e}")
+
+
+# ============================================================
+# LEADERBOARD
+# ============================================================
+async def top_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    counts = message_count.get(chat_id, {})
+    if not counts:
+        await update.message.reply_text("📊 Abhi koi activity data nahi hai.")
+        return
+    ranked = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:10]
+    lines = ["🏆 *Top Active Members*\n"]
+    medals = ["🥇", "🥈", "🥉"]
+    for i, (uid, count) in enumerate(ranked):
+        name = active_members.get(chat_id, {}).get(uid, f"User {uid}")
+        marker = medals[i] if i < 3 else f"{i + 1}."
+        lines.append(f"{marker} {name} — {count} messages")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ============================================================
+# LINK WHITELIST
+# ============================================================
+async def allow_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_group_admin(update, context):
+        return
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: `/allowlink <domain or t.me/username>`", parse_mode="Markdown")
+        return
+    chat_id = update.message.chat_id
+    entry = context.args[0].lower()
+    link_whitelist[chat_id].add(entry)
+    await update.message.reply_text(f"✅ \"{entry}\" is now allowed in this group.")
+
+
+async def disallow_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_group_admin(update, context):
+        return
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: `/disallowlink <domain or t.me/username>`", parse_mode="Markdown")
+        return
+    chat_id = update.message.chat_id
+    entry = context.args[0].lower()
+    link_whitelist[chat_id].discard(entry)
+    await update.message.reply_text(f"✅ \"{entry}\" removed from the allow-list.")
+
+
+async def list_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_group_admin(update, context):
+        return
+    chat_id = update.message.chat_id
+    entries = link_whitelist.get(chat_id, set())
+    text = "🔗 *Always-allowed:* group/channel's own links\n"
+    if entries:
+        text += "*Extra whitelisted:*\n" + ", ".join(sorted(entries))
+    else:
+        text += "No extra whitelisted links."
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def kick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -627,30 +795,65 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     known_chats.add(chat_id)
 
-    # Track active members for /tagall
+    # Track active members for /tagall and leaderboard
     if chat_type in ["group", "supergroup"] and user.id != ADMIN_ID and not user.is_bot:
         active_members[chat_id][user.id] = user.first_name
+        message_count[chat_id][user.id] += 1
 
     # Remember recent messages so the AI can match this group's tone/style
     if not user.is_bot:
         chat_history[chat_id].append(update.message.text)
 
+    is_grp_admin = await is_group_admin(update, context)
+
+    # Slow mode (skip for admins)
+    if chat_type in ["group", "supergroup"] and not is_grp_admin and slow_mode[chat_id] > 0:
+        now = time.time()
+        last = last_message_time[chat_id].get(user.id, 0)
+        if now - last < slow_mode[chat_id]:
+            try:
+                await update.message.delete()
+            except Exception as e:
+                log.warning(f"Slow mode delete failed: {e}")
+            return
+        last_message_time[chat_id][user.id] = now
+
     # Anti-flood (skip for admins)
-    if chat_type in ["group", "supergroup"] and not await is_group_admin(update, context):
+    if chat_type in ["group", "supergroup"] and not is_grp_admin:
         if await check_flood(update, context):
             return
 
-    # Anti-link
-    if chat_type in ["group", "supergroup"] and not await is_group_admin(update, context):
-        if any(link in text for link in ["http://", "https://", "t.me/", ".com", ".in"]):
+    # Bad word filter (skip for admins)
+    if chat_type in ["group", "supergroup"] and not is_grp_admin and bad_words.get(chat_id):
+        if any(word in text for word in bad_words[chat_id]):
             try:
                 await update.message.delete()
-                warning = await update.message.reply_text(f"⚠️ {user.first_name}, yahan links allowed nahi hai!")
-                await asyncio.sleep(5)
-                await warning.delete()
             except Exception as e:
-                log.warning(f"Anti-link cleanup failed: {e}")
+                log.warning(f"Bad word delete failed: {e}")
+            result = await apply_warning(chat_id, user, context, reason="inappropriate language")
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=result)
+            except Exception:
+                pass
             return
+
+    # Anti-link — own group/channel links and anything whitelisted always pass through
+    if chat_type in ["group", "supergroup"] and not is_grp_admin:
+        if any(link in text for link in ["http://", "https://", "t.me/", ".com", ".in"]):
+            own_or_whitelisted = (
+                GROUP_LINK.lower() in update.message.text.lower()
+                or CHANNEL_LINK.lower() in update.message.text.lower()
+                or any(w in text for w in link_whitelist.get(chat_id, set()))
+            )
+            if not own_or_whitelisted:
+                try:
+                    await update.message.delete()
+                    warning = await update.message.reply_text(f"⚠️ {user.first_name}, yahan links allowed nahi hai!")
+                    await asyncio.sleep(5)
+                    await warning.delete()
+                except Exception as e:
+                    log.warning(f"Anti-link cleanup failed: {e}")
+                return
 
     # Group / channel link requests — always answer these, private or group
     if "link" in text:
@@ -716,11 +919,20 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("rules", show_rules))
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("topmembers", top_members))
 
     # Admin config
     app.add_handler(CommandHandler("setrules", set_rules))
+    app.add_handler(CommandHandler("setwelcome", set_welcome))
     app.add_handler(CommandHandler("autoapprove", toggle_autoapprove))
     app.add_handler(CommandHandler("setdelay", set_delay))
+    app.add_handler(CommandHandler("slowmode", set_slowmode))
+    app.add_handler(CommandHandler("addbadword", add_bad_word))
+    app.add_handler(CommandHandler("removebadword", remove_bad_word))
+    app.add_handler(CommandHandler("badwords", list_bad_words))
+    app.add_handler(CommandHandler("allowlink", allow_link))
+    app.add_handler(CommandHandler("disallowlink", disallow_link))
+    app.add_handler(CommandHandler("listlinks", list_links))
     app.add_handler(CommandHandler("tagall", tag_all))
     app.add_handler(CommandHandler("tagadmins", tag_admins))
     app.add_handler(CommandHandler("call", call_user))
@@ -739,6 +951,7 @@ def main():
     # Callbacks & events
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(ChatJoinRequestHandler(join_request))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messages))
 
     log.info("🚀 Prime X Assistant deployed successfully!")
