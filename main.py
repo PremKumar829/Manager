@@ -5,6 +5,7 @@ import logging
 import tempfile
 import threading
 import requests
+from datetime import datetime, timedelta, time as dt_time
 from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -73,6 +74,19 @@ sticker_replies = defaultdict(dict)        # chat_id -> {keyword: sticker_file_i
 discord_webhooks = {}                      # chat_id -> Discord webhook URL for relaying messages
 channel_links = defaultdict(set)           # channel_chat_id -> set of group_chat_ids to auto-forward into
 
+persona = {}                               # chat_id -> custom bot personality description
+coins = defaultdict(lambda: defaultdict(int))     # chat_id -> {user_id: coin balance}
+custom_titles = defaultdict(dict)          # chat_id -> {user_id: purchased title}
+streaks = defaultdict(dict)                # chat_id -> {user_id: {"count": int, "last_date": date}}
+automod_enabled = defaultdict(bool)        # chat_id -> smart AI auto-mod on/off
+trivia_sessions = {}                       # chat_id -> active trivia round state
+
+SHOP_ITEMS = {"title": 200, "shoutout": 50}
+COINS_PER_MESSAGE = 1
+TRIVIA_WIN_COINS = 15
+STREAK_MILESTONE_BONUS = 50
+STREAK_MILESTONE_EVERY = 7
+
 TAG_BATCH_SIZE = 5           # mentions per tag message (keeps it readable)
 TAG_BATCH_DELAY = 1.5        # seconds between batches (avoid Telegram rate limits)
 
@@ -131,7 +145,7 @@ def get_target_user(update: Update):
 # ============================================================
 # AI REPLY WITH FALLBACK CHAIN
 # ============================================================
-async def get_ai_reply(prompt: str, style_context: list = None) -> str:
+async def get_ai_reply(prompt: str, style_context: list = None, persona_text: str = None) -> str:
     if not ai_client:
         return "❌ Bhai, GEMINI_API_KEY set nahi hai!"
 
@@ -144,32 +158,84 @@ async def get_ai_reply(prompt: str, style_context: list = None) -> str:
             "just absorb the vibe):\n" + sample
         )
 
-    system_prompt = (
+    base_persona = persona_text or (
         "You are a casual telegram group member. Reply in short Hinglish. "
         "Tone should be friendly. Do not act like an AI."
-        + style_hint
     )
+    system_prompt = base_persona + style_hint
 
     last_error = None
     for model_name in GEMINI_MODEL_CHAIN:
+        for attempt in range(2):  # one retry per model for transient (429/503) errors
+            try:
+                def fetch_response():
+                    response = ai_client.models.generate_content(
+                        model=model_name,
+                        contents=system_prompt + "\n\nUser: " + prompt
+                    )
+                    return response.text
+
+                reply = await asyncio.to_thread(fetch_response)
+                if reply:
+                    return reply
+            except Exception as e:
+                last_error = e
+                log.warning(f"Model '{model_name}' attempt {attempt + 1} failed: {repr(e)}")
+                if attempt == 0:
+                    await asyncio.sleep(2)  # brief backoff before retrying same model
+                continue
+
+    log.error(f"All Gemini models failed. Last error: {repr(last_error)}")
+    return "❌ AI abhi thoda busy hai, thodi der me try karo! (Run /testai to see the exact error)"
+
+
+async def test_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only diagnostic — shows the exact error for each model in the fallback
+    chain, so you can tell if it's an invalid key, quota limit, or missing model access."""
+    if not is_admin(update):
+        return
+    if not ai_client:
+        await update.message.reply_text("❌ GEMINI_API_KEY is missing or not loaded from .env.")
+        return
+
+    await update.message.reply_text("🔧 Testing all models, ek second...")
+    results = []
+    for model_name in GEMINI_MODEL_CHAIN:
         try:
-            def fetch_response():
-                response = ai_client.models.generate_content(
-                    model=model_name,
-                    contents=system_prompt + "\n\nUser: " + prompt
-                )
-                return response.text
-
-            reply = await asyncio.to_thread(fetch_response)
-            if reply:
-                return reply
+            def fetch():
+                r = ai_client.models.generate_content(model=model_name, contents="Say hi in one word.")
+                return r.text
+            reply = await asyncio.to_thread(fetch)
+            results.append(f"✅ {model_name} → {reply.strip()[:60]}")
         except Exception as e:
-            last_error = e
-            log.warning(f"Model '{model_name}' failed: {e}. Trying next fallback...")
-            continue
+            results.append(f"❌ {model_name} → {repr(e)[:150]}")
 
-    log.error(f"All Gemini models failed. Last error: {last_error}")
-    return "❌ AI abhi thoda busy hai, thodi der me try karo!"
+    await update.message.reply_text("🔧 *AI Diagnostic Results:*\n\n" + "\n\n".join(results), parse_mode="Markdown")
+
+
+# ============================================================
+# PERSONA CUSTOMIZATION
+# ============================================================
+async def set_persona(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_group_admin(update, context):
+        return
+    text = " ".join(context.args)
+    if not text:
+        await update.message.reply_text(
+            "⚠️ Usage: `/setpersona <description>`\n"
+            "Example: `/setpersona ek witty sarcastic dost jo sabko roast karta hai but pyaar se`",
+            parse_mode="Markdown"
+        )
+        return
+    persona[update.message.chat_id] = text
+    await update.message.reply_text("✅ Bot persona updated for this group!")
+
+
+async def reset_persona(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_group_admin(update, context):
+        return
+    persona.pop(update.message.chat_id, None)
+    await update.message.reply_text("✅ Persona reset to default (friendly Hinglish group member).")
 
 
 # ============================================================
@@ -201,10 +267,20 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /rules — Show group rules\n"
         "• /stats — Group activity stats\n"
         "• /topmembers — Most active members leaderboard\n"
+        "• /profile — Your coins, streak, and title\n"
+        "• /balance — Check your coin balance\n"
+        "• /shop, /buy <item> <text> — Spend coins on titles/shoutouts\n"
+        "• /mystreak — Your daily activity streak\n"
+        "• /trivia — Start a multiplayer trivia round 🎯\n"
+        "• /trivialeaderboard — Trivia win rankings\n"
         "• Send a voice note (or reply to bot with one) — I'll transcribe it 🎙️\n\n"
         "*Admin only*\n"
+        "• /testai — Diagnose AI errors (shows exact API error per model)\n"
         "• /setrules <text> — Set group rules\n"
         "• /setwelcome <msg> — Custom welcome message (use {name})\n"
+        "• /setpersona <description> / /resetpersona — Customize AI personality\n"
+        "• /automod on|off — Smart AI toxicity detection\n"
+        "• /digest — Preview today's AI chat summary now\n"
         "• /autoapprove on|off — Toggle join-request auto-approval\n"
         "• /setdelay <seconds> — Join-request auto-approve delay\n"
         "• /slowmode <seconds> — Limit messages per user (0 = off)\n"
@@ -820,6 +896,311 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             log.warning(f"Channel forward to {group_id} failed: {e}")
 
 
+# ============================================================
+# VIRTUAL CURRENCY + SHOP
+# ============================================================
+def add_coins(chat_id: int, user_id: int, amount: int):
+    coins[chat_id][user_id] += amount
+
+
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    user_id = update.message.from_user.id
+    await update.message.reply_text(f"💰 Your balance: {coins[chat_id][user_id]} coins")
+
+
+async def shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "🛒 *Shop*\n\n"
+        f"• `title` — {SHOP_ITEMS['title']} coins — Set a custom title\n"
+        f"• `shoutout` — {SHOP_ITEMS['shoutout']} coins — Dramatic group announcement\n\n"
+        "Usage:\n`/buy title <your title>`\n`/buy shoutout <message>`\n\n"
+        f"Earn coins: +{COINS_PER_MESSAGE}/message, +{TRIVIA_WIN_COINS} per trivia win, "
+        f"+{STREAK_MILESTONE_BONUS} every {STREAK_MILESTONE_EVERY}-day streak."
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def buy_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    user = update.message.from_user
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: `/buy <item> <text>` — see `/shop`", parse_mode="Markdown")
+        return
+
+    item = context.args[0].lower()
+    extra_text = " ".join(context.args[1:])
+    if item not in SHOP_ITEMS:
+        await update.message.reply_text("⚠️ Unknown item. Check `/shop`.", parse_mode="Markdown")
+        return
+
+    cost = SHOP_ITEMS[item]
+    if coins[chat_id][user.id] < cost:
+        await update.message.reply_text(f"❌ Not enough coins. Need {cost}, you have {coins[chat_id][user.id]}.")
+        return
+
+    if item == "title" and not extra_text:
+        await update.message.reply_text("⚠️ Usage: `/buy title <your title>`", parse_mode="Markdown")
+        return
+
+    coins[chat_id][user.id] -= cost
+
+    if item == "title":
+        custom_titles[chat_id][user.id] = extra_text
+        await update.message.reply_text(f"✅ Title set: \"{extra_text}\" 🎉")
+    elif item == "shoutout":
+        msg = extra_text or "Sabko dhyan dena chahiye!"
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"📣 *SHOUTOUT* 📣\n\n[{user.first_name}](tg://user?id={user.id}): {msg}",
+            parse_mode="Markdown"
+        )
+
+
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    user = update.message.from_user
+    streak_info = streaks.get(chat_id, {}).get(user.id, {"count": 0})
+    title = custom_titles.get(chat_id, {}).get(user.id)
+    title_line = f"🏷️ Title: {title}\n" if title else ""
+    text = (
+        f"👤 *Profile — {user.first_name}*\n\n"
+        f"{title_line}"
+        f"💬 Messages: {message_count.get(chat_id, {}).get(user.id, 0)}\n"
+        f"🔥 Streak: {streak_info['count']} day(s)\n"
+        f"💰 Coins: {coins[chat_id][user.id]}\n"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ============================================================
+# STREAK SYSTEM
+# ============================================================
+def update_streak(chat_id: int, user_id: int):
+    today = datetime.utcnow().date()
+    info = streaks[chat_id].get(user_id)
+    if not info:
+        streaks[chat_id][user_id] = {"count": 1, "last_date": today}
+        return
+    last_date = info["last_date"]
+    if today == last_date:
+        return  # already counted today
+    if today == last_date + timedelta(days=1):
+        info["count"] += 1
+        info["last_date"] = today
+        if info["count"] % STREAK_MILESTONE_EVERY == 0:
+            add_coins(chat_id, user_id, STREAK_MILESTONE_BONUS)
+    else:
+        info["count"] = 1
+        info["last_date"] = today
+
+
+async def my_streak(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    info = streaks.get(chat_id, {}).get(update.message.from_user.id, {"count": 0})
+    await update.message.reply_text(f"🔥 Your current streak: {info['count']} day(s) in a row")
+
+
+# ============================================================
+# SMART AI AUTO-MOD
+# ============================================================
+async def toggle_automod(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_group_admin(update, context):
+        return
+    chat_id = update.message.chat_id
+    if not context.args or context.args[0].lower() not in ("on", "off"):
+        current = "ON ✅" if automod_enabled[chat_id] else "OFF ❌"
+        await update.message.reply_text(
+            f"⚙️ Smart AI auto-mod currently **{current}**.\nUsage: `/automod on` or `/automod off`",
+            parse_mode="Markdown"
+        )
+        return
+    automod_enabled[chat_id] = context.args[0].lower() == "on"
+    state = "enabled ✅ — AI will catch genuine toxicity/harassment (casual banter is fine)" \
+        if automod_enabled[chat_id] else "disabled ❌"
+    await update.message.reply_text(f"⚙️ Smart AI auto-mod {state}.")
+
+
+async def ai_is_toxic(text: str) -> bool:
+    if not ai_client:
+        return False
+    try:
+        def fetch():
+            r = ai_client.models.generate_content(
+                model=GEMINI_MODEL_CHAIN[0],
+                contents=(
+                    "You moderate a casual Hinglish Telegram group. Casual slang, playful "
+                    "insults between friends, and mild swearing are NORMAL — do not flag those. "
+                    "Only flag genuine harassment, hate speech, threats, or targeted bullying. "
+                    "Respond with exactly one word: YES if toxic, NO if not.\n\n"
+                    f"Message: {text}"
+                )
+            )
+            return r.text.strip().upper()
+        result = await asyncio.to_thread(fetch)
+        return result.startswith("YES")
+    except Exception as e:
+        log.warning(f"Automod check failed: {e}")
+        return False
+
+
+# ============================================================
+# MULTIPLAYER TRIVIA GAME
+# ============================================================
+TRIVIA_TIME_LIMIT = 30  # seconds
+
+
+async def generate_trivia_question():
+    if not ai_client:
+        return None
+    prompt = (
+        "Generate one fun general-knowledge trivia question for a casual group chat. "
+        "Respond in EXACTLY this format and nothing else:\n"
+        "Q: <question>\nA: <option A>\nB: <option B>\nC: <option C>\nD: <option D>\nCORRECT: <letter>"
+    )
+
+    def fetch():
+        r = ai_client.models.generate_content(model=GEMINI_MODEL_CHAIN[0], contents=prompt)
+        return r.text
+
+    try:
+        raw = await asyncio.to_thread(fetch)
+        data = {}
+        for line in [l.strip() for l in raw.strip().split("\n") if l.strip()]:
+            if line.startswith("Q:"):
+                data["question"] = line[2:].strip()
+            elif line.startswith("A:"):
+                data["A"] = line[2:].strip()
+            elif line.startswith("B:"):
+                data["B"] = line[2:].strip()
+            elif line.startswith("C:"):
+                data["C"] = line[2:].strip()
+            elif line.startswith("D:"):
+                data["D"] = line[2:].strip()
+            elif line.startswith("CORRECT:"):
+                data["correct"] = line.split(":", 1)[1].strip().upper()[:1]
+        if all(k in data for k in ["question", "A", "B", "C", "D", "correct"]):
+            return data
+    except Exception as e:
+        log.warning(f"Trivia generation failed: {e}")
+    return None
+
+
+async def start_trivia(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    if trivia_sessions.get(chat_id, {}).get("active"):
+        await update.message.reply_text("⚠️ Ek trivia round already chal raha hai!")
+        return
+
+    await update.message.reply_text("🎯 Generating trivia question...")
+    q = await generate_trivia_question()
+    if not q:
+        await update.message.reply_text("❌ Trivia generate nahi ho paya, thodi der me try karo.")
+        return
+
+    existing_scores = trivia_sessions.get(chat_id, {}).get("scores", defaultdict(int))
+    trivia_sessions[chat_id] = {
+        "question": q, "active": True, "answered_by": None, "scores": existing_scores
+    }
+
+    text = (
+        f"🎯 *Trivia Time!*\n\n{q['question']}\n\n"
+        f"A) {q['A']}\nB) {q['B']}\nC) {q['C']}\nD) {q['D']}\n\n"
+        f"Reply with just the letter (A/B/C/D). {TRIVIA_TIME_LIMIT} seconds!"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+    if context.job_queue:
+        context.job_queue.run_once(end_trivia_round, TRIVIA_TIME_LIMIT, data={"chat_id": chat_id})
+
+
+async def end_trivia_round(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.data["chat_id"]
+    session = trivia_sessions.get(chat_id)
+    if not session or not session["active"]:
+        return
+    session["active"] = False
+    if not session["answered_by"]:
+        correct = session["question"]["correct"]
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⏰ Time's up! Koi sahi answer nahi de paya. Correct answer tha: {correct}"
+        )
+
+
+async def handle_trivia_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Checks a plain A/B/C/D reply against an active trivia round. Returns True if handled."""
+    chat_id = update.message.chat_id
+    session = trivia_sessions.get(chat_id)
+    if not session or not session["active"]:
+        return False
+    answer = update.message.text.strip().upper()
+    if answer not in ("A", "B", "C", "D"):
+        return False
+
+    correct = session["question"]["correct"]
+    if answer == correct:
+        session["active"] = False
+        session["answered_by"] = update.message.from_user.id
+        session["scores"][update.message.from_user.id] += 1
+        add_coins(chat_id, update.message.from_user.id, TRIVIA_WIN_COINS)
+        await update.message.reply_text(
+            f"🎉 Correct! {update.message.from_user.first_name} jeet gaye aur {TRIVIA_WIN_COINS} coins mile!"
+        )
+    else:
+        await update.message.reply_text("❌ Galat, try again!")
+    return True
+
+
+async def trivia_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    scores = trivia_sessions.get(chat_id, {}).get("scores", {})
+    if not scores:
+        await update.message.reply_text("📊 Abhi koi trivia scores nahi hain. `/trivia` se shuru karo!", parse_mode="Markdown")
+        return
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:10]
+    lines = ["🏆 *Trivia Leaderboard*\n"]
+    for i, (uid, score) in enumerate(ranked):
+        name = active_members.get(chat_id, {}).get(uid, f"User {uid}")
+        lines.append(f"{i + 1}. {name} — {score} win(s)")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ============================================================
+# DAILY GROUP DIGEST
+# ============================================================
+async def send_daily_digest(context: ContextTypes.DEFAULT_TYPE):
+    for chat_id in list(known_chats):
+        history = list(chat_history.get(chat_id, []))
+        if len(history) < 5:
+            continue
+        sample = "\n".join(history[-50:])
+        prompt = (
+            "Summarize today's group chat highlights in 3-4 short bullet points. "
+            "Hinglish, fun and casual tone:\n" + sample
+        )
+        try:
+            summary = await get_ai_reply(prompt, persona_text=persona.get(chat_id))
+            await context.bot.send_message(chat_id=chat_id, text=f"📰 *Daily Digest*\n\n{summary}", parse_mode="Markdown")
+        except Exception as e:
+            log.warning(f"Digest failed for chat {chat_id}: {e}")
+
+
+async def digest_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: preview the digest immediately instead of waiting for the daily schedule."""
+    if not is_admin(update):
+        return
+    chat_id = update.message.chat_id
+    history = list(chat_history.get(chat_id, []))
+    if not history:
+        await update.message.reply_text("⏳ Not enough chat history yet.")
+        return
+    sample = "\n".join(history[-50:])
+    prompt = "Summarize today's group chat highlights in 3-4 short bullet points, Hinglish fun tone:\n" + sample
+    summary = await get_ai_reply(prompt, persona_text=persona.get(chat_id))
+    await update.message.reply_text(f"📰 *Digest Preview*\n\n{summary}", parse_mode="Markdown")
+
+
 async def kick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_group_admin(update, context):
         return
@@ -977,10 +1358,17 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     known_chats.add(chat_id)
 
+    # Check trivia answers first — a bare "A"/"B"/"C"/"D" reply shouldn't hit any other filter
+    if chat_type in ["group", "supergroup"] and not user.is_bot:
+        if await handle_trivia_answer(update, context):
+            return
+
     # Track active members for /tagall and leaderboard
     if chat_type in ["group", "supergroup"] and user.id != ADMIN_ID and not user.is_bot:
         active_members[chat_id][user.id] = user.first_name
         message_count[chat_id][user.id] += 1
+        add_coins(chat_id, user.id, COINS_PER_MESSAGE)
+        update_streak(chat_id, user.id)
 
     # Remember recent messages so the AI can match this group's tone/style
     if not user.is_bot:
@@ -1004,6 +1392,21 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_type in ["group", "supergroup"] and not is_grp_admin:
         if await check_flood(update, context):
             return
+
+    # Smart AI auto-mod (skip for admins) — only checks longer messages to keep replies fast/cheap
+    if chat_type in ["group", "supergroup"] and not is_grp_admin and automod_enabled[chat_id]:
+        if len(update.message.text.split()) >= 4:
+            if await ai_is_toxic(update.message.text):
+                try:
+                    await update.message.delete()
+                except Exception as e:
+                    log.warning(f"Automod delete failed: {e}")
+                result = await apply_warning(chat_id, user, context, reason="AI flagged toxic content")
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=result)
+                except Exception:
+                    pass
+                return
 
     # Bad word filter (skip for admins)
     if chat_type in ["group", "supergroup"] and not is_grp_admin and bad_words.get(chat_id):
@@ -1080,7 +1483,11 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_type == "private" or (chat_type in ["group", "supergroup"] and (bot_username in text or is_reply_to_bot)):
         try:
             await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-            ai_reply = await get_ai_reply(update.message.text, style_context=list(chat_history[chat_id]))
+            ai_reply = await get_ai_reply(
+                update.message.text,
+                style_context=list(chat_history[chat_id]),
+                persona_text=persona.get(chat_id)
+            )
             await update.message.reply_text(ai_reply)
         except Exception as e:
             log.error(f"AI reply failed: {e}")
@@ -1104,6 +1511,16 @@ def validate_config():
 # ============================================================
 # MAIN
 # ============================================================
+# ============================================================
+# GLOBAL ERROR HANDLER (catches anything unhandled so the bot never crashes silently)
+# ============================================================
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.error(f"Unhandled exception: {context.error}", exc_info=context.error)
+
+
+# ============================================================
+# MAIN
+# ============================================================
 def main():
     validate_config()
     threading.Thread(target=run_dummy_server, daemon=True).start()
@@ -1116,10 +1533,22 @@ def main():
     app.add_handler(CommandHandler("rules", show_rules))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("topmembers", top_members))
+    app.add_handler(CommandHandler("testai", test_ai))
+    app.add_handler(CommandHandler("balance", balance))
+    app.add_handler(CommandHandler("shop", shop))
+    app.add_handler(CommandHandler("buy", buy_item))
+    app.add_handler(CommandHandler("profile", profile))
+    app.add_handler(CommandHandler("mystreak", my_streak))
+    app.add_handler(CommandHandler("trivia", start_trivia))
+    app.add_handler(CommandHandler("trivialeaderboard", trivia_leaderboard))
 
     # Admin config
     app.add_handler(CommandHandler("setrules", set_rules))
     app.add_handler(CommandHandler("setwelcome", set_welcome))
+    app.add_handler(CommandHandler("setpersona", set_persona))
+    app.add_handler(CommandHandler("resetpersona", reset_persona))
+    app.add_handler(CommandHandler("automod", toggle_automod))
+    app.add_handler(CommandHandler("digest", digest_now))
     app.add_handler(CommandHandler("autoapprove", toggle_autoapprove))
     app.add_handler(CommandHandler("setdelay", set_delay))
     app.add_handler(CommandHandler("slowmode", set_slowmode))
@@ -1157,6 +1586,17 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, handle_channel_post))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messages))
+
+    app.add_error_handler(error_handler)
+
+    if app.job_queue:
+        app.job_queue.run_daily(send_daily_digest, time=dt_time(hour=21, minute=0))
+        log.info("📰 Daily digest scheduled for 21:00 UTC.")
+    else:
+        log.warning(
+            "job_queue not available — daily digest disabled. "
+            "Install with: pip install \"python-telegram-bot[job-queue]\""
+        )
 
     log.info("🚀 Prime X Assistant deployed successfully!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
