@@ -1509,10 +1509,7 @@ def validate_config():
 
 
 # ============================================================
-# MAIN
-# ============================================================
-# ============================================================
-# GLOBAL ERROR HANDLER (catches anything unhandled so the bot never crashes silently)
+# GLOBAL ERROR HANDLER
 # ============================================================
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error(f"Unhandled exception: {context.error}", exc_info=context.error)
@@ -1599,6 +1596,13 @@ def main():
         )
 
     log.info("🚀 Prime X Assistant deployed successfully!")
+    
+    # ----------------------------------------------------
+    # FIX: Initialize the event loop to prevent RuntimeError
+    # ----------------------------------------------------
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
