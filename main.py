@@ -95,6 +95,19 @@ TRIVIA_WIN_COINS = 15
 STREAK_MILESTONE_BONUS = 50
 STREAK_MILESTONE_EVERY = 7
 
+birthdays = defaultdict(dict)                       # chat_id -> {user_id: "DD-MM"}
+badges = defaultdict(lambda: defaultdict(set))       # chat_id -> {user_id: {badge_names}}
+first_seen = defaultdict(dict)                       # chat_id -> {user_id: datetime} — for time-based badges
+MESSAGE_MILESTONES = [100, 500, 1000, 5000]
+TIME_MILESTONES = {
+    7: "🌱 1 Week Member",
+    30: "🌿 1 Month Member",
+    90: "🌳 3 Month Member",
+    365: "🏆 1 Year Member",
+}
+BADGE_BONUS_COINS = 25
+BIRTHDAY_BONUS_COINS = 50
+
 TAG_BATCH_SIZE = 5           # mentions per tag message (keeps it readable)
 TAG_BATCH_DELAY = 1.5        # seconds between batches (avoid Telegram rate limits)
 
@@ -405,6 +418,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /balance — Check your coin balance\n"
         "• /shop, /buy <item> <text> — Spend coins on titles/shoutouts\n"
         "• /mystreak — Your daily activity streak\n"
+        "• /setbirthday DD-MM, /mybirthday, /removebirthday — Birthday tracker 🎂\n"
+        "• /mybadges — See your unlocked achievement badges 🏅\n"
         "• /trivia — Start a multiplayer trivia round 🎯\n"
         "• /trivialeaderboard — Trivia win rankings\n"
         "• /tictactoe (reply to opponent) — Challenge someone to 1v1 ❌⭕\n"
@@ -912,7 +927,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tmp_path = tmp.name
         await voice_file.download_to_drive(tmp_path)
         transcription = await transcribe_voice(tmp_path)
-        await update.message.reply_text(f"🎙️ *Transcription:*\n{transcription}", parse_mode="Markdown")
+        await update.message.reply_text(f"🎙️ Transcription:\n{transcription}")
     except Exception as e:
         log.error(f"Voice handling failed: {e}")
         await update.message.reply_text("❌ Voice message process nahi ho paya.")
@@ -1142,6 +1157,110 @@ async def my_streak(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
+# BIRTHDAY TRACKER
+# ============================================================
+async def set_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    user = update.message.from_user
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: /setbirthday DD-MM\nExample: /setbirthday 25-12")
+        return
+    try:
+        day_str, month_str = context.args[0].split("-")
+        day, month = int(day_str), int(month_str)
+        if not (1 <= day <= 31 and 1 <= month <= 12):
+            raise ValueError
+    except (ValueError, IndexError):
+        await update.message.reply_text("⚠️ Format sahi nahi hai. Usage: /setbirthday DD-MM\nExample: /setbirthday 25-12")
+        return
+    birthdays[chat_id][user.id] = f"{day:02d}-{month:02d}"
+    await update.message.reply_text(f"✅ Birthday set: {day:02d}-{month:02d} 🎂 Us din group mein wish milegi!")
+
+
+async def my_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    bday = birthdays.get(chat_id, {}).get(update.message.from_user.id)
+    if bday:
+        await update.message.reply_text(f"🎂 Your birthday: {bday}")
+    else:
+        await update.message.reply_text("⚠️ Birthday set nahi hai. `/setbirthday DD-MM` use karo.", parse_mode="Markdown")
+
+
+async def remove_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    birthdays.get(chat_id, {}).pop(update.message.from_user.id, None)
+    await update.message.reply_text("✅ Birthday removed.")
+
+
+async def check_birthdays(context: ContextTypes.DEFAULT_TYPE):
+    today = datetime.utcnow().strftime("%d-%m")
+    for chat_id, members in list(birthdays.items()):
+        for user_id, bday in members.items():
+            if bday == today:
+                name = active_members.get(chat_id, {}).get(user_id, "Someone")
+                try:
+                    add_coins(chat_id, user_id, BIRTHDAY_BONUS_COINS)
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"🎉🎂 Happy Birthday {name}! 🎈🎊\n\n"
+                            f"Sabki taraf se shubhkaamnaayein! (+{BIRTHDAY_BONUS_COINS} coins 🎁)"
+                        )
+                    )
+                except Exception as e:
+                    log.warning(f"Birthday wish failed for {chat_id}/{user_id}: {e}")
+
+
+# ============================================================
+# ACHIEVEMENT BADGES
+# ============================================================
+async def check_message_badges(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    count = message_count.get(chat_id, {}).get(user_id, 0)
+    for milestone in MESSAGE_MILESTONES:
+        badge_name = f"💬 {milestone} Messages"
+        if count >= milestone and badge_name not in badges[chat_id][user_id]:
+            badges[chat_id][user_id].add(badge_name)
+            add_coins(chat_id, user_id, BADGE_BONUS_COINS)
+            name = active_members.get(chat_id, {}).get(user_id, "Someone")
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🏅 {name} ne badge unlock kiya: {badge_name}! (+{BADGE_BONUS_COINS} coins)"
+                )
+            except Exception as e:
+                log.warning(f"Badge announce failed: {e}")
+
+
+async def check_time_badges(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.utcnow()
+    for chat_id, members in list(first_seen.items()):
+        for user_id, joined in members.items():
+            days = (now - joined).days
+            for threshold, badge_name in TIME_MILESTONES.items():
+                if days >= threshold and badge_name not in badges[chat_id][user_id]:
+                    badges[chat_id][user_id].add(badge_name)
+                    add_coins(chat_id, user_id, BADGE_BONUS_COINS)
+                    name = active_members.get(chat_id, {}).get(user_id, "Someone")
+                    try:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"🏅 {name} ne badge unlock kiya: {badge_name}! (+{BADGE_BONUS_COINS} coins)"
+                        )
+                    except Exception as e:
+                        log.warning(f"Time badge announce failed: {e}")
+
+
+async def my_badges(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    user_badges = badges.get(chat_id, {}).get(update.message.from_user.id, set())
+    if not user_badges:
+        await update.message.reply_text("🏅 Abhi koi badge nahi mila. Active raho, milestones pe auto mil jayega!")
+        return
+    text = "🏅 Your Badges:\n\n" + "\n".join(f"• {b}" for b in sorted(user_badges))
+    await update.message.reply_text(text)
+
+
+# ============================================================
 # SMART AI AUTO-MOD
 # ============================================================
 async def toggle_automod(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1194,7 +1313,11 @@ async def generate_trivia_question():
     if not ai_client:
         return None
     prompt = (
-        "Generate one fun general-knowledge trivia question for a casual group chat. "
+        "Generate one EASY, fun, general-knowledge trivia question suitable for a casual "
+        "Hinglish Telegram group chat with regular people, not experts or students. "
+        "Keep it simple — everyday topics like movies, sports, food, geography, common facts. "
+        "AVOID niche, technical, academic, or hard/obscure questions. "
+        "Do NOT use any markdown symbols like * _ [ ] in your response — plain text only. "
         "Respond in EXACTLY this format and nothing else:\n"
         "Q: <question>\nA: <option A>\nB: <option B>\nC: <option C>\nD: <option D>\nCORRECT: <letter>"
     )
@@ -1244,11 +1367,17 @@ async def start_trivia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     text = (
-        f"🎯 *Trivia Time!*\n\n{q['question']}\n\n"
+        f"🎯 Trivia Time!\n\n{q['question']}\n\n"
         f"A) {q['A']}\nB) {q['B']}\nC) {q['C']}\nD) {q['D']}\n\n"
         f"Reply with just the letter (A/B/C/D). {TRIVIA_TIME_LIMIT} seconds!"
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    try:
+        await update.message.reply_text(text)  # plain text — AI-generated content can break Markdown parsing
+    except Exception as e:
+        log.error(f"Trivia message send failed: {e}")
+        trivia_sessions.pop(chat_id, None)
+        await update.message.reply_text("❌ Trivia question bhejne mein error aaya, dobara try karo.")
+        return
 
     if context.job_queue:
         context.job_queue.run_once(end_trivia_round, TRIVIA_TIME_LIMIT, data={"chat_id": chat_id})
@@ -1541,7 +1670,7 @@ async def send_daily_digest(context: ContextTypes.DEFAULT_TYPE):
         )
         try:
             summary = await get_ai_reply(prompt, persona_text=persona.get(chat_id))
-            await context.bot.send_message(chat_id=chat_id, text=f"📰 *Daily Digest*\n\n{summary}", parse_mode="Markdown")
+            await context.bot.send_message(chat_id=chat_id, text=f"📰 Daily Digest\n\n{summary}")
         except Exception as e:
             log.warning(f"Digest failed for chat {chat_id}: {e}")
 
@@ -1558,7 +1687,7 @@ async def digest_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sample = "\n".join(history[-50:])
     prompt = "Summarize today's group chat highlights in 3-4 short bullet points, Hinglish fun tone:\n" + sample
     summary = await get_ai_reply(prompt, persona_text=persona.get(chat_id))
-    await update.message.reply_text(f"📰 *Digest Preview*\n\n{summary}", parse_mode="Markdown")
+    await update.message.reply_text(f"📰 Digest Preview\n\n{summary}")
 
 
 async def kick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1736,6 +1865,9 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message_count[chat_id][user.id] += 1
         add_coins(chat_id, user.id, COINS_PER_MESSAGE)
         update_streak(chat_id, user.id)
+        if user.id not in first_seen[chat_id]:
+            first_seen[chat_id][user.id] = datetime.utcnow()
+        await check_message_badges(chat_id, user.id, context)
 
     # Remember recent messages so the AI can match this group's tone/style
     if not user.is_bot:
@@ -1906,6 +2038,10 @@ def main():
     app.add_handler(CommandHandler("buy", buy_item))
     app.add_handler(CommandHandler("profile", profile))
     app.add_handler(CommandHandler("mystreak", my_streak))
+    app.add_handler(CommandHandler("setbirthday", set_birthday))
+    app.add_handler(CommandHandler("mybirthday", my_birthday))
+    app.add_handler(CommandHandler("removebirthday", remove_birthday))
+    app.add_handler(CommandHandler("mybadges", my_badges))
     app.add_handler(CommandHandler("trivia", start_trivia))
     app.add_handler(CommandHandler("trivialeaderboard", trivia_leaderboard))
     app.add_handler(CommandHandler("tictactoe", start_tictactoe))
@@ -1969,10 +2105,12 @@ def main():
 
     if app.job_queue:
         app.job_queue.run_daily(send_daily_digest, time=dt_time(hour=21, minute=0))
-        log.info("📰 Daily digest scheduled for 21:00 UTC.")
+        app.job_queue.run_daily(check_birthdays, time=dt_time(hour=3, minute=0))
+        app.job_queue.run_daily(check_time_badges, time=dt_time(hour=3, minute=30))
+        log.info("📰 Daily digest (21:00 UTC), 🎂 birthdays (03:00 UTC), 🏅 time badges (03:30 UTC) scheduled.")
     else:
         log.warning(
-            "job_queue not available — daily digest disabled. "
+            "job_queue not available — daily digest/birthdays/badges disabled. "
             "Install with: pip install \"python-telegram-bot[job-queue]\""
         )
 
