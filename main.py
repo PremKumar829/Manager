@@ -1,5 +1,6 @@
 import os
 import time
+import random
 import asyncio
 import logging
 import tempfile
@@ -57,7 +58,7 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 # NVIDIA NIM fallback — kicks in ONLY if every Gemini model above fails (rate limit, quota, outage).
 # Get a free key at https://build.nvidia.com — pick any chat model and copy its exact model ID.
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
-NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "meta/llama-3.1-70b-instruct")
+NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "meta/llama-3.3-70b-instruct")
 nvidia_client = OpenAI(api_key=NVIDIA_API_KEY, base_url="https://integrate.api.nvidia.com/v1") if NVIDIA_API_KEY else None
 
 # ============================================================
@@ -121,10 +122,21 @@ def run_dummy_server():
 # ============================================================
 # HELPERS
 # ============================================================
+bot_admins = set()  # user_ids the owner has promoted — get admin power in EVERY group, not just one
+
+
+def is_owner(user_id: int) -> bool:
+    return user_id == ADMIN_ID
+
+
+def is_bot_admin_id(user_id: int) -> bool:
+    return user_id == ADMIN_ID or user_id in bot_admins
+
+
 def is_admin(update: Update) -> bool:
     if not update.message:
         return False
-    if update.message.from_user and update.message.from_user.id == ADMIN_ID:
+    if update.message.from_user and is_bot_admin_id(update.message.from_user.id):
         return True
     if update.message.sender_chat and update.message.sender_chat.id == update.message.chat_id:
         return True
@@ -132,7 +144,8 @@ def is_admin(update: Update) -> bool:
 
 
 async def is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Checks Telegram-level admin status too (not just bot owner)."""
+    """True if the sender is the bot owner, a promoted bot-admin (any group),
+    OR a native Telegram admin of this specific group."""
     if is_admin(update):
         return True
     try:
@@ -147,6 +160,78 @@ def get_target_user(update: Update):
     if update.message.reply_to_message:
         return update.message.reply_to_message.from_user
     return None
+
+
+# ============================================================
+# BOT ADMIN PANEL (owner-only management of global bot-admins)
+# ============================================================
+async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.message.from_user.id):
+        await update.message.reply_text("❌ Sirf bot owner naye admin bana sakta hai.")
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Usage: `/addadmin <telegram_user_id>`\n"
+            "User ka numeric ID @userinfobot se nikaal sakte ho.",
+            parse_mode="Markdown"
+        )
+        return
+    try:
+        uid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ User ID numeric hona chahiye, e.g. `123456789`.", parse_mode="Markdown")
+        return
+    bot_admins.add(uid)
+    await update.message.reply_text(
+        f"✅ User `{uid}` ab bot admin hai — sabhi groups mein admin commands use kar sakta hai.",
+        parse_mode="Markdown"
+    )
+
+
+async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.message.from_user.id):
+        await update.message.reply_text("❌ Sirf bot owner admin remove kar sakta hai.")
+        return
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: `/removeadmin <telegram_user_id>`", parse_mode="Markdown")
+        return
+    try:
+        uid = int(context.args[0])
+    except ValueError:
+        return
+    bot_admins.discard(uid)
+    await update.message.reply_text(f"✅ User `{uid}` bot admins se remove kar diya gaya.", parse_mode="Markdown")
+
+
+async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_bot_admin_id(update.message.from_user.id):
+        return
+    text = f"👑 *Owner:* `{ADMIN_ID}`\n\n"
+    if bot_admins:
+        text += "🛡️ *Bot Admins:*\n" + "\n".join(f"• `{uid}`" for uid in bot_admins)
+    else:
+        text += "🛡️ Koi extra bot admin abhi set nahi hai."
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_bot_admin_id(update.message.from_user.id):
+        return
+    text = (
+        "🛠️ *Bot Admin Panel*\n\n"
+        f"👑 Owner ID: `{ADMIN_ID}`\n"
+        f"🛡️ Bot Admins: {len(bot_admins)}\n"
+        f"💬 Known chats (groups + DMs): {len(known_chats)}\n\n"
+        "*Owner-only commands:*\n"
+        "`/addadmin <id>` — promote a user to global bot-admin\n"
+        "`/removeadmin <id>` — demote them\n"
+        "`/listadmins` — see current admins\n"
+        "`/broadcast <msg>` — message every known chat\n"
+        "`/digest`, `/testai` — diagnostics\n\n"
+        "_Bot admins get full admin power in EVERY group the bot is in — "
+        "not just where they're a Telegram admin._"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 # ============================================================
@@ -222,6 +307,10 @@ async def test_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Owner-only diagnostic — shows the exact error for each model in the fallback
     chain, so you can tell if it's an invalid key, quota limit, or missing model access."""
     if not is_admin(update):
+        await update.message.reply_text(
+            "❌ Ye command sirf bot owner/admin use kar sakta hai. "
+            "Apna ADMIN_ID .env mein double-check karo (@userinfobot se apna exact numeric ID lo)."
+        )
         return
     if not ai_client:
         await update.message.reply_text("❌ GEMINI_API_KEY is missing or not loaded from .env.")
@@ -318,9 +407,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /mystreak — Your daily activity streak\n"
         "• /trivia — Start a multiplayer trivia round 🎯\n"
         "• /trivialeaderboard — Trivia win rankings\n"
+        "• /tictactoe (reply to opponent) — Challenge someone to 1v1 ❌⭕\n"
+        "• /wordchain — Start a group word chain game 🔗\n"
+        "• /mathblitz — Fast math race, first correct answer wins 🧮\n"
         "• Send a voice note (or reply to bot with one) — I'll transcribe it 🎙️\n\n"
         "*Admin only*\n"
         "• /testai — Diagnose AI errors (shows exact API error per model)\n"
+        "• /endwordchain — Stop an active word chain\n"
+        "• /adminpanel — Bot admin overview (owner + bot admins)\n"
+        "• /addadmin, /removeadmin, /listadmins <id> — Owner: manage global bot admins\n"
         "• /setrules <text> — Set group rules\n"
         "• /setwelcome <msg> — Custom welcome message (use {name})\n"
         "• /setpersona <description> / /resetpersona — Customize AI personality\n"
@@ -1212,6 +1307,226 @@ async def trivia_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # ============================================================
+# MULTIPLAYER GAME: TIC-TAC-TOE (1v1, inline buttons)
+# ============================================================
+ttt_games = {}  # chat_id -> game state
+TTT_WIN_COINS = 20
+TTT_LINES = [(0, 1, 2), (3, 4, 5), (6, 7, 8), (0, 3, 6), (1, 4, 7), (2, 5, 8), (0, 4, 8), (2, 4, 6)]
+
+
+def render_ttt_board(board):
+    symbols = {" ": "➕", "X": "❌", "O": "⭕"}
+    keyboard = []
+    for r in range(3):
+        row = [InlineKeyboardButton(symbols[board[r * 3 + c]], callback_data=f"ttt_{r * 3 + c}") for c in range(3)]
+        keyboard.append(row)
+    return InlineKeyboardMarkup(keyboard)
+
+
+def check_ttt_winner(board):
+    for a, b, c in TTT_LINES:
+        if board[a] != " " and board[a] == board[b] == board[c]:
+            return board[a]
+    return "DRAW" if " " not in board else None
+
+
+async def start_tictactoe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    if ttt_games.get(chat_id, {}).get("active"):
+        await update.message.reply_text("⚠️ Ek Tic-Tac-Toe already chal raha hai is group mein!")
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text(
+            "⚠️ Jisko challenge karna hai, uske message pe reply karke `/tictactoe` bhejo.",
+            parse_mode="Markdown"
+        )
+        return
+    opponent = update.message.reply_to_message.from_user
+    challenger = update.message.from_user
+    if opponent.id == challenger.id:
+        await update.message.reply_text("⚠️ Khud se nahi khel sakte! 😅")
+        return
+    if opponent.is_bot:
+        await update.message.reply_text("⚠️ Bot ko challenge nahi kar sakte!")
+        return
+
+    ttt_games[chat_id] = {
+        "active": True, "board": [" "] * 9, "turn": "X",
+        "player_x": challenger.id, "player_o": opponent.id,
+        "names": {challenger.id: challenger.first_name, opponent.id: opponent.first_name}
+    }
+    await update.message.reply_text(
+        f"🎮 *Tic-Tac-Toe!*\n❌ {challenger.first_name} vs ⭕ {opponent.first_name}\n\n{challenger.first_name}'s turn (❌)",
+        reply_markup=render_ttt_board([" "] * 9),
+        parse_mode="Markdown"
+    )
+
+
+async def handle_ttt_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = query.message.chat_id
+    game = ttt_games.get(chat_id)
+    if not game or not game["active"]:
+        await query.answer("Koi active game nahi hai. /tictactoe se naya shuru karo!")
+        return
+
+    idx = int(query.data.split("_")[1])
+    current_player_id = game["player_x"] if game["turn"] == "X" else game["player_o"]
+    if query.from_user.id != current_player_id:
+        await query.answer("⏳ Ye tumhari turn nahi hai!")
+        return
+    if game["board"][idx] != " ":
+        await query.answer("❌ Cell already filled!")
+        return
+
+    await query.answer()
+    game["board"][idx] = game["turn"]
+    winner = check_ttt_winner(game["board"])
+
+    if winner:
+        game["active"] = False
+        if winner == "DRAW":
+            text = "🤝 Match draw ho gaya!"
+        else:
+            winner_id = game["player_x"] if winner == "X" else game["player_o"]
+            add_coins(chat_id, winner_id, TTT_WIN_COINS)
+            text = f"🎉 {game['names'][winner_id]} jeet gaye! (+{TTT_WIN_COINS} coins)"
+        await query.edit_message_text(text, reply_markup=render_ttt_board(game["board"]))
+        return
+
+    game["turn"] = "O" if game["turn"] == "X" else "X"
+    next_id = game["player_x"] if game["turn"] == "X" else game["player_o"]
+    symbol = "❌" if game["turn"] == "X" else "⭕"
+    await query.edit_message_text(
+        f"🎮 *Tic-Tac-Toe*\n{game['names'][next_id]}'s turn ({symbol})",
+        reply_markup=render_ttt_board(game["board"]),
+        parse_mode="Markdown"
+    )
+
+
+# ============================================================
+# MULTIPLAYER GAME: WORD CHAIN (whole group, free-for-all)
+# ============================================================
+word_chain_sessions = {}  # chat_id -> {"active": bool, "last_word": str, "used_words": set()}
+WORD_CHAIN_STARTERS = ["apple", "orange", "tiger", "dance", "music", "cricket", "bottle", "garden", "yellow"]
+WORD_CHAIN_COINS = 2
+
+
+async def start_word_chain(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    if word_chain_sessions.get(chat_id, {}).get("active"):
+        await update.message.reply_text("⚠️ Word chain already chal raha hai! `/endwordchain` se roko.", parse_mode="Markdown")
+        return
+    starter = random.choice(WORD_CHAIN_STARTERS)
+    word_chain_sessions[chat_id] = {"active": True, "last_word": starter, "used_words": {starter}}
+    await update.message.reply_text(
+        f"🔗 *Word Chain Shuru!*\n\nStarting word: *{starter}*\n\n"
+        f"Next word '*{starter[-1].upper()}*' se shuru hona chahiye — koi bhi member type kar sakta hai!",
+        parse_mode="Markdown"
+    )
+
+
+async def end_word_chain(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_group_admin(update, context):
+        return
+    chat_id = update.message.chat_id
+    if word_chain_sessions.get(chat_id, {}).get("active"):
+        word_chain_sessions[chat_id]["active"] = False
+        await update.message.reply_text("🔗 Word chain end kar diya gaya.")
+    else:
+        await update.message.reply_text("⚠️ Koi active word chain nahi hai.")
+
+
+async def handle_word_chain_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    chat_id = update.message.chat_id
+    session = word_chain_sessions.get(chat_id)
+    if not session or not session["active"]:
+        return False
+
+    text = update.message.text.strip().lower()
+    if not text.isalpha() or len(text) < 2:
+        return False  # not a plain word — let normal chat handling continue
+
+    required_letter = session["last_word"][-1]
+    if text[0] != required_letter:
+        return False  # doesn't continue the chain — ignore, don't disrupt normal chat
+
+    if text in session["used_words"]:
+        await update.message.reply_text(f"❌ \"{text}\" already use ho chuka hai! Doosra word try karo.")
+        return True
+
+    session["used_words"].add(text)
+    session["last_word"] = text
+    add_coins(chat_id, update.message.from_user.id, WORD_CHAIN_COINS)
+    await update.message.reply_text(
+        f"✅ {update.message.from_user.first_name}: *{text}*\nNext word '*{text[-1].upper()}*' se shuru!",
+        parse_mode="Markdown"
+    )
+    return True
+
+
+# ============================================================
+# MULTIPLAYER GAME: MATH BLITZ (fast race, no AI needed)
+# ============================================================
+math_blitz_sessions = {}  # chat_id -> {"active": bool, "answer": int}
+MATH_BLITZ_TIME_LIMIT = 20
+MATH_BLITZ_COINS = 10
+
+
+async def start_math_blitz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    if math_blitz_sessions.get(chat_id, {}).get("active"):
+        await update.message.reply_text("⚠️ Math blitz already chal raha hai!")
+        return
+
+    op = random.choice(["+", "-", "*"])
+    if op == "*":
+        a, b = random.randint(2, 12), random.randint(2, 12)
+        answer = a * b
+    elif op == "+":
+        a, b = random.randint(2, 50), random.randint(2, 50)
+        answer = a + b
+    else:
+        a, b = random.randint(2, 50), random.randint(2, 50)
+        answer = a - b
+
+    math_blitz_sessions[chat_id] = {"active": True, "answer": answer}
+    await update.message.reply_text(
+        f"🧮 *Math Blitz!*\n\n{a} {op} {b} = ?\n\nFastest sahi jawab jeetega! {MATH_BLITZ_TIME_LIMIT} seconds ⏱️",
+        parse_mode="Markdown"
+    )
+    if context.job_queue:
+        context.job_queue.run_once(end_math_blitz, MATH_BLITZ_TIME_LIMIT, data={"chat_id": chat_id})
+
+
+async def end_math_blitz(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.data["chat_id"]
+    session = math_blitz_sessions.get(chat_id)
+    if session and session["active"]:
+        session["active"] = False
+        await context.bot.send_message(chat_id=chat_id, text=f"⏰ Time's up! Answer tha: {session['answer']}")
+
+
+async def handle_math_blitz_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    chat_id = update.message.chat_id
+    session = math_blitz_sessions.get(chat_id)
+    if not session or not session["active"]:
+        return False
+    try:
+        guess = int(update.message.text.strip())
+    except ValueError:
+        return False
+    if guess == session["answer"]:
+        session["active"] = False
+        add_coins(chat_id, update.message.from_user.id, MATH_BLITZ_COINS)
+        await update.message.reply_text(
+            f"🎉 Correct! {update.message.from_user.first_name} jeet gaye! (+{MATH_BLITZ_COINS} coins)"
+        )
+        return True
+    return False  # wrong guess — let it pass through, don't spam "wrong" on every random number
+
+
+# ============================================================
 # DAILY GROUP DIGEST
 # ============================================================
 async def send_daily_digest(context: ContextTypes.DEFAULT_TYPE):
@@ -1307,11 +1622,14 @@ async def pin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.from_user or update.message.from_user.id != ADMIN_ID:
+    if not is_bot_admin_id(update.message.from_user.id):
         return
     text = " ".join(context.args)
     if not text:
-        await update.message.reply_text("⚠️ Usage: `/broadcast <message>`", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"⚠️ Usage: `/broadcast <message>`\n📊 Will reach {len(known_chats)} known chat(s).",
+            parse_mode="Markdown"
+        )
         return
     sent, failed = 0, 0
     for chat_id in list(known_chats):
@@ -1403,9 +1721,13 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     known_chats.add(chat_id)
 
-    # Check trivia answers first — a bare "A"/"B"/"C"/"D" reply shouldn't hit any other filter
+    # Check active game answers first — these shouldn't hit any other filter
     if chat_type in ["group", "supergroup"] and not user.is_bot:
         if await handle_trivia_answer(update, context):
+            return
+        if await handle_math_blitz_answer(update, context):
+            return
+        if await handle_word_chain_answer(update, context):
             return
 
     # Track active members for /tagall and leaderboard
@@ -1586,6 +1908,16 @@ def main():
     app.add_handler(CommandHandler("mystreak", my_streak))
     app.add_handler(CommandHandler("trivia", start_trivia))
     app.add_handler(CommandHandler("trivialeaderboard", trivia_leaderboard))
+    app.add_handler(CommandHandler("tictactoe", start_tictactoe))
+    app.add_handler(CommandHandler("wordchain", start_word_chain))
+    app.add_handler(CommandHandler("endwordchain", end_word_chain))
+    app.add_handler(CommandHandler("mathblitz", start_math_blitz))
+
+    # Bot admin panel (owner-managed, works across all groups)
+    app.add_handler(CommandHandler("addadmin", add_admin))
+    app.add_handler(CommandHandler("removeadmin", remove_admin))
+    app.add_handler(CommandHandler("listadmins", list_admins))
+    app.add_handler(CommandHandler("adminpanel", admin_panel))
 
     # Admin config
     app.add_handler(CommandHandler("setrules", set_rules))
@@ -1625,7 +1957,8 @@ def main():
     app.add_handler(CommandHandler("pin", pin_message))
 
     # Callbacks & events
-    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(CallbackQueryHandler(button_handler, pattern="^owner_info$"))
+    app.add_handler(CallbackQueryHandler(handle_ttt_click, pattern="^ttt_"))
     app.add_handler(ChatJoinRequestHandler(join_request))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
