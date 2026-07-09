@@ -10,8 +10,7 @@ from datetime import datetime, timedelta, time as dt_time
 from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from google import genai
-from openai import OpenAI  # used for NVIDIA fallback (OpenAI-compatible API)
+from openai import OpenAI  # Sirf OpenAI library use hogi NVIDIA ke liye
 from dotenv import load_dotenv
 from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -25,14 +24,10 @@ from telegram.ext import (
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 OWNER_NAME = "@PREMGUPTA2M"
 CHANNEL_LINK = "https://t.me/+Gouc7PsDosk4MTRl"
 GROUP_LINK = "https://t.me/+rSqVXbRig4BjOTc1"
-
-# Models to try in order.
-GEMINI_MODEL_CHAIN = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-001"]
 
 MAX_WARNINGS = 3          
 FLOOD_MSG_LIMIT = 6       
@@ -49,10 +44,8 @@ logging.basicConfig(
 log = logging.getLogger("PrimeXAssistant")
 
 # ============================================================
-# AI CLIENT SETUP
+# AI CLIENT SETUP (NVIDIA ONLY)
 # ============================================================
-ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "meta/llama-3.3-70b-instruct")
 nvidia_client = OpenAI(api_key=NVIDIA_API_KEY, base_url="https://integrate.api.nvidia.com/v1") if NVIDIA_API_KEY else None
@@ -106,7 +99,6 @@ BIRTHDAY_BONUS_COINS = 50
 TAG_BATCH_SIZE = 5           
 TAG_BATCH_DELAY = 1.5        
 
-# --- NEW FEATURES VARIABLES ---
 promo_codes = {}             
 rewarded_groups = set()      
 BOT_ADD_REWARD = 500         
@@ -199,16 +191,16 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👑 Owner ID: `{ADMIN_ID}`\n"
         f"🛡️ Bot Admins: {len(bot_admins)}\n"
         f"💬 Known chats: {len(known_chats)}\n\n"
-        "`/addadmin <id>`, `/removeadmin <id>`, `/listadmins`, `/broadcast <msg>`, `/genpromo`"
+        "`/addadmin <id>`, `/removeadmin <id>`, `/listadmins`, `/testai`, `/genpromo`"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
 # ============================================================
-# AI REPLY WITH FALLBACK CHAIN
+# AI REPLY (NVIDIA ONLY)
 # ============================================================
 async def get_ai_reply(prompt: str, style_context: list = None, persona_text: str = None) -> str:
-    if not ai_client and not nvidia_client:
-        return "❌ GEMINI_API_KEY aur NVIDIA_API_KEY dono missing hain!"
+    if not nvidia_client:
+        return "❌ NVIDIA_API_KEY missing hai!"
 
     style_hint = ""
     if style_context:
@@ -218,64 +210,33 @@ async def get_ai_reply(prompt: str, style_context: list = None, persona_text: st
     base_persona = persona_text or "You are a casual telegram group member. Reply in short Hinglish."
     system_prompt = base_persona + style_hint
 
-    last_error = None
-    if ai_client:
-        for model_name in GEMINI_MODEL_CHAIN:
-            for attempt in range(2): 
-                try:
-                    def fetch_response():
-                        response = ai_client.models.generate_content(
-                            model=model_name,
-                            contents=system_prompt + "\n\nUser: " + prompt
-                        )
-                        return response.text
-                    reply = await asyncio.to_thread(fetch_response)
-                    if reply: return reply
-                except Exception as e:
-                    last_error = e
-                    if attempt == 0: await asyncio.sleep(2) 
-                    continue
-
-    if nvidia_client:
-        try:
-            def fetch_nvidia():
-                completion = nvidia_client.chat.completions.create(
-                    model=NVIDIA_MODEL,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt}
-                    ],
-                    max_tokens=512,
-                )
-                return completion.choices[0].message.content
-            reply = await asyncio.to_thread(fetch_nvidia)
-            if reply: return reply
-        except Exception as e:
-            log.error(f"NVIDIA fallback failed: {repr(e)}")
-
-    return "❌ AI abhi thoda busy hai, thodi der me try karo!"
+    try:
+        def fetch_nvidia():
+            completion = nvidia_client.chat.completions.create(
+                model=NVIDIA_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=512,
+            )
+            return completion.choices[0].message.content
+        reply = await asyncio.to_thread(fetch_nvidia)
+        if reply: return reply
+    except Exception as e:
+        log.error(f"NVIDIA API failed: {repr(e)}")
+        return f"❌ AI abhi busy hai. Error: {repr(e)[:50]}"
 
 async def test_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
-    await update.message.reply_text("🔧 Testing models...")
+    await update.message.reply_text("🔧 Testing NVIDIA API...")
     results = []
     
-    if ai_client:
-        for model_name in GEMINI_MODEL_CHAIN:
-            try:
-                def fetch(): return ai_client.models.generate_content(model=model_name, contents="Hi").text
-                reply = await asyncio.to_thread(fetch)
-                results.append(f"✅ {model_name} → {reply.strip()[:60]}")
-            except Exception as e:
-                results.append(f"❌ {model_name} → {repr(e)[:100]}")
-    else:
-        results.append("⚪ Gemini not configured.")
-
     if nvidia_client:
         try:
             def fetch_nvidia(): return nvidia_client.chat.completions.create(model=NVIDIA_MODEL, messages=[{"role": "user", "content": "Hi"}], max_tokens=20).choices[0].message.content
             reply = await asyncio.to_thread(fetch_nvidia)
-            results.append(f"✅ NVIDIA → {reply.strip()[:60]}")
+            results.append(f"✅ NVIDIA ({NVIDIA_MODEL}) → {reply.strip()[:60]}")
         except Exception as e:
             results.append(f"❌ NVIDIA → {repr(e)[:100]}")
     else:
@@ -361,25 +322,6 @@ async def set_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📜 *Group Rules:*\n\n{group_rules[update.message.chat_id]}", parse_mode="Markdown")
 
-async def tag_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_group_admin(update, context): return
-    chat_id = update.message.chat_id
-    if not active_members.get(chat_id): return
-    members = list(active_members[chat_id].items())
-    for i in range(0, len(members), TAG_BATCH_SIZE):
-        batch = members[i:i + TAG_BATCH_SIZE]
-        mentions = " ".join(f"[{fname}](tg://user?id={uid})" for uid, fname in batch)
-        await context.bot.send_message(chat_id=chat_id, text=f"📢\n{mentions}", parse_mode="Markdown")
-        await asyncio.sleep(TAG_BATCH_DELAY)
-
-async def tag_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_group_admin(update, context): return
-    chat_id = update.message.chat_id
-    try: admins = await context.bot.get_chat_administrators(chat_id)
-    except: return
-    mentions = " ".join(f"[{a.user.first_name}](tg://user?id={a.user.id})" for a in admins if not a.user.is_bot)
-    await context.bot.send_message(chat_id=chat_id, text=f"📢 Admins:\n{mentions}", parse_mode="Markdown")
-
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📊 Members tracked: {len(active_members.get(update.message.chat_id, {}))}")
 
@@ -447,7 +389,7 @@ async def ban_user(update, context):
         except: pass
 
 # ============================================================
-# WELCOME & BOT ADD REWARD (NEW FEATURE)
+# WELCOME & BOT ADD REWARD 
 # ============================================================
 async def set_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_group_admin(update, context): return
@@ -459,7 +401,6 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
     adder = update.message.from_user 
     
     for member in update.message.new_chat_members:
-        # Check if the bot was added
         if member.id == context.bot.id:
             if chat_id not in rewarded_groups:
                 rewarded_groups.add(chat_id)
@@ -592,13 +533,18 @@ async def set_birthday(update, context):
         await update.message.reply_text(f"✅ Birthday set to {context.args[0]}")
 
 # ============================================================
-# GAMES (Trivia, Tic-Tac-Toe, Math, WordChain)
+# GAMES (Trivia using NVIDIA, Tic-Tac-Toe, Math, WordChain)
 # ============================================================
 async def generate_trivia_question():
-    if not ai_client: return None
+    if not nvidia_client: return None
     prompt = "Generate one fun trivia question. Format:\nQ: <question>\nA: <A>\nB: <B>\nC: <C>\nD: <D>\nCORRECT: <letter>"
     try:
-        raw = await asyncio.to_thread(lambda: ai_client.models.generate_content(model=GEMINI_MODEL_CHAIN[0], contents=prompt).text)
+        def fetch_trivia():
+            return nvidia_client.chat.completions.create(
+                model=NVIDIA_MODEL, messages=[{"role": "user", "content": prompt}], max_tokens=200
+            ).choices[0].message.content
+            
+        raw = await asyncio.to_thread(fetch_trivia)
         data = {}
         for line in raw.strip().split('\n'):
             if line.startswith("Q:"): data["question"] = line[2:].strip()
@@ -608,14 +554,15 @@ async def generate_trivia_question():
             elif line.startswith("D:"): data["D"] = line[2:].strip()
             elif line.startswith("CORRECT:"): data["correct"] = line.split(":")[1].strip().upper()[:1]
         if all(k in data for k in ["question", "A", "B", "C", "D", "correct"]): return data
-    except: pass
+    except Exception as e: 
+        log.error(f"Trivia error: {e}")
     return None
 
 async def start_trivia(update, context):
     chat_id = update.message.chat_id
     if trivia_sessions.get(chat_id, {}).get("active"): return
     q = await generate_trivia_question()
-    if not q: return await update.message.reply_text("❌ Failed to generate trivia.")
+    if not q: return await update.message.reply_text("❌ Failed to generate trivia from NVIDIA.")
     trivia_sessions[chat_id] = {"question": q, "active": True, "answered_by": None, "scores": trivia_sessions.get(chat_id, {}).get("scores", defaultdict(int))}
     text = f"🎯 Trivia!\n\n{q['question']}\nA) {q['A']}\nB) {q['B']}\nC) {q['C']}\nD) {q['D']}\n\nReply A/B/C/D."
     await update.message.reply_text(text)
@@ -805,7 +752,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messages))
     app.add_error_handler(error_handler)
 
-    log.info("🚀 Prime X Assistant (Full Version) starting...")
+    log.info("🚀 Prime X Assistant (NVIDIA ONLY) starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
