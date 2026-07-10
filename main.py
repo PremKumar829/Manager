@@ -996,12 +996,36 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_reply = update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id
 
     if chat_type == "private" or (bot_uname in text or is_reply):
+        stop_typing = asyncio.Event()
+
+        async def _keep_typing():
+            while not stop_typing.is_set():
+                try:
+                    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+                except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(stop_typing.wait(), timeout=4)
+                except asyncio.TimeoutError:
+                    pass
+
+        typing_task = asyncio.create_task(_keep_typing())
         try:
-            await context.bot.send_chat_action(chat_id=chat_id, action="typing")
             reply = await get_ai_reply(update.message.text, list(chat_history[chat_id]), persona.get(chat_id))
+            if not reply:
+                reply = "🤖 Kuch gadbad ho gayi, dobara try karo."
+            if len(reply) > 4000:
+                reply = reply[:4000] + "…"
             await update.message.reply_text(reply)
         except Exception as e:
             log.error(f"AI failed: {repr(e)}")
+            try:
+                await update.message.reply_text("❌ AI reply bhejte waqt error aaya. Dobara try karo.")
+            except Exception as e2:
+                log.error(f"Fallback reply also failed: {repr(e2)}")
+        finally:
+            stop_typing.set()
+            typing_task.cancel()
 
 # ============================================================
 # ERROR HANDLER
