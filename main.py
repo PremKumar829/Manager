@@ -19,6 +19,22 @@ from telegram.ext import (
 )
 
 # ============================================================
+# CHANGELOG (bug fixes applied in this version)
+# ------------------------------------------------------------
+# 1. get_ai_reply() no longer silently returns None on an empty
+#    AI response - it now always returns a string.
+# 2. All NVIDIA API calls now have a timeout=15, so one slow
+#    request can no longer hang a handler indefinitely.
+# 3. Bare "except: pass" blocks (mute/unmute/kick/ban/set_delay/
+#    welcome message) now log the actual error so failures are
+#    visible instead of silently making the bot look "slow".
+# 4. Added 3 new multiplayer games: /rps (1v1), /triviarace
+#    (group race, button based), /mathduel (1v1, button based).
+#    These are separate from your existing /tictactoe, /trivia,
+#    /mathblitz, /wordchain - no collisions.
+# ============================================================
+
+# ============================================================
 # CONFIGURATION
 # ============================================================
 load_dotenv()
@@ -29,10 +45,13 @@ OWNER_NAME = "@PREMGUPTA2M"
 CHANNEL_LINK = "https://t.me/+Gouc7PsDosk4MTRl"
 GROUP_LINK = "https://t.me/+rSqVXbRig4BjOTc1"
 
-MAX_WARNINGS = 3          
-FLOOD_MSG_LIMIT = 6       
-FLOOD_WINDOW_SECONDS = 8  
+MAX_WARNINGS = 3
+FLOOD_MSG_LIMIT = 6
+FLOOD_WINDOW_SECONDS = 8
 FLOOD_MUTE_MINUTES = 10
+
+NVIDIA_TIMEOUT_SECONDS = 15
+GAME_TIMEOUT_SECONDS = 90
 
 # ============================================================
 # LOGGING
@@ -51,31 +70,31 @@ NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "meta/llama-3.3-70b-instruct")
 nvidia_client = OpenAI(api_key=NVIDIA_API_KEY, base_url="https://integrate.api.nvidia.com/v1") if NVIDIA_API_KEY else None
 
 # ============================================================
-# GLOBAL STATE 
+# GLOBAL STATE
 # ============================================================
 group_rules = defaultdict(lambda: "Group ke rules abhi set nahi hain.")
-active_members = defaultdict(dict)        
-warnings = defaultdict(lambda: defaultdict(int))  
+active_members = defaultdict(dict)
+warnings = defaultdict(lambda: defaultdict(int))
 message_log = defaultdict(lambda: defaultdict(lambda: deque(maxlen=FLOOD_MSG_LIMIT + 1)))
-known_chats = set()                       
-approval_settings = defaultdict(lambda: {"enabled": True, "delay": 5})  
-chat_history = defaultdict(lambda: deque(maxlen=30))  
-custom_welcome = {}                        
-bad_words = defaultdict(set)               
-message_count = defaultdict(lambda: defaultdict(int))  
-slow_mode = defaultdict(int)               
-last_message_time = defaultdict(dict)      
-link_whitelist = defaultdict(set)          
-sticker_replies = defaultdict(dict)        
-discord_webhooks = {}                      
-channel_links = defaultdict(set)           
+known_chats = set()
+approval_settings = defaultdict(lambda: {"enabled": True, "delay": 5})
+chat_history = defaultdict(lambda: deque(maxlen=30))
+custom_welcome = {}
+bad_words = defaultdict(set)
+message_count = defaultdict(lambda: defaultdict(int))
+slow_mode = defaultdict(int)
+last_message_time = defaultdict(dict)
+link_whitelist = defaultdict(set)
+sticker_replies = defaultdict(dict)
+discord_webhooks = {}
+channel_links = defaultdict(set)
 
-persona = {}                               
-coins = defaultdict(lambda: defaultdict(int))     
-custom_titles = defaultdict(dict)          
-streaks = defaultdict(dict)                
-automod_enabled = defaultdict(bool)        
-trivia_sessions = {}                       
+persona = {}
+coins = defaultdict(lambda: defaultdict(int))
+custom_titles = defaultdict(dict)
+streaks = defaultdict(dict)
+automod_enabled = defaultdict(bool)
+trivia_sessions = {}
 
 SHOP_ITEMS = {"title": 200, "shoutout": 50}
 COINS_PER_MESSAGE = 1
@@ -83,9 +102,9 @@ TRIVIA_WIN_COINS = 15
 STREAK_MILESTONE_BONUS = 50
 STREAK_MILESTONE_EVERY = 7
 
-birthdays = defaultdict(dict)                       
-badges = defaultdict(lambda: defaultdict(set))       
-first_seen = defaultdict(dict)                       
+birthdays = defaultdict(dict)
+badges = defaultdict(lambda: defaultdict(set))
+first_seen = defaultdict(dict)
 MESSAGE_MILESTONES = [100, 500, 1000, 5000]
 TIME_MILESTONES = {
     7: "🌱 1 Week Member",
@@ -96,12 +115,17 @@ TIME_MILESTONES = {
 BADGE_BONUS_COINS = 25
 BIRTHDAY_BONUS_COINS = 50
 
-TAG_BATCH_SIZE = 5           
-TAG_BATCH_DELAY = 1.5        
+TAG_BATCH_SIZE = 5
+TAG_BATCH_DELAY = 1.5
 
-promo_codes = {}             
-rewarded_groups = set()      
-BOT_ADD_REWARD = 500         
+promo_codes = {}
+rewarded_groups = set()
+BOT_ADD_REWARD = 500
+
+# New multiplayer game rewards
+RPS_WIN_COINS = 20
+TRIVIA_RACE_WIN_COINS = 25
+MATH_DUEL_WIN_COINS = 20
 
 # ============================================================
 # DUMMY WEB SERVER (Render health check)
@@ -124,7 +148,7 @@ def run_dummy_server():
 # ============================================================
 # HELPERS
 # ============================================================
-bot_admins = set() 
+bot_admins = set()
 
 def is_owner(user_id: int) -> bool:
     return user_id == ADMIN_ID
@@ -143,7 +167,8 @@ async def is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         member = await context.bot.get_chat_member(update.message.chat_id, update.message.from_user.id)
         return member.status in ("administrator", "creator")
-    except Exception:
+    except Exception as e:
+        log.error(f"is_group_admin check failed: {repr(e)}")
         return False
 
 def get_target_user(update: Update):
@@ -219,10 +244,13 @@ async def get_ai_reply(prompt: str, style_context: list = None, persona_text: st
                     {"role": "user", "content": prompt}
                 ],
                 max_tokens=512,
+                timeout=NVIDIA_TIMEOUT_SECONDS,
             )
             return completion.choices[0].message.content
         reply = await asyncio.to_thread(fetch_nvidia)
-        if reply: return reply
+        if reply:
+            return reply
+        return "🤖 AI ne khaali reply diya, dobara try karo."
     except Exception as e:
         log.error(f"NVIDIA API failed: {repr(e)}")
         return f"❌ AI abhi busy hai. Error: {repr(e)[:50]}"
@@ -231,10 +259,14 @@ async def test_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     await update.message.reply_text("🔧 Testing NVIDIA API...")
     results = []
-    
+
     if nvidia_client:
         try:
-            def fetch_nvidia(): return nvidia_client.chat.completions.create(model=NVIDIA_MODEL, messages=[{"role": "user", "content": "Hi"}], max_tokens=20).choices[0].message.content
+            def fetch_nvidia():
+                return nvidia_client.chat.completions.create(
+                    model=NVIDIA_MODEL, messages=[{"role": "user", "content": "Hi"}],
+                    max_tokens=20, timeout=NVIDIA_TIMEOUT_SECONDS
+                ).choices[0].message.content
             reply = await asyncio.to_thread(fetch_nvidia)
             results.append(f"✅ NVIDIA ({NVIDIA_MODEL}) → {reply.strip()[:60]}")
         except Exception as e:
@@ -279,8 +311,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /rules, /stats, /topmembers\n"
         "• /profile, /balance, /shop, /buy\n"
         "• /redeem <CODE> — Redeem promo codes\n"
-        "• /mystreak, /setbirthday, /mybadges\n"
-        "• /trivia, /tictactoe, /wordchain, /mathblitz\n\n"
+        "• /mystreak, /setbirthday, /mybadges\n\n"
+        "*Solo/Group Games*\n"
+        "• /trivia — AI generated trivia (text answer)\n"
+        "• /tictactoe — 1v1, reply to challenge\n"
+        "• /mathblitz — group race, first to type answer\n"
+        "• /wordchain — group word chain\n\n"
+        "*New Multiplayer Games*\n"
+        "• /rps — Rock-Paper-Scissors 1v1 (reply to challenge)\n"
+        "• /triviarace — button-based group race\n"
+        "• /mathduel — 1v1 button-based math duel (reply to challenge)\n\n"
         "*Admin only*\n"
         "• /testai, /adminpanel, /genpromo\n"
         "• /setrules, /setwelcome, /setpersona\n"
@@ -293,10 +333,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.data == "owner_info":
+    data = query.data
+    if data == "owner_info":
         await query.edit_message_text(f"Mere owner **{OWNER_NAME}** hain.", parse_mode="Markdown")
-    elif query.data.startswith("ttt_"):
+    elif data.startswith("ttt_"):
         await handle_ttt_click(update, context)
+    elif data.startswith("rps_"):
+        await handle_rps_click(update, context)
+    elif data.startswith("tr_"):
+        await handle_trivia_race_click(update, context)
+    elif data.startswith("md_"):
+        await handle_math_duel_click(update, context)
 
 # ============================================================
 # GROUP CONFIG COMMANDS
@@ -306,11 +353,12 @@ async def set_delay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         approval_settings[update.message.chat_id]["delay"] = int(context.args[0])
         await update.message.reply_text("✅ Delay updated.")
-    except: pass
+    except Exception as e:
+        log.error(f"set_delay failed: {repr(e)}")
 
 async def toggle_autoapprove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_group_admin(update, context): return
-    if context.args: 
+    if context.args:
         approval_settings[update.message.chat_id]["enabled"] = context.args[0].lower() == "on"
         await update.message.reply_text("✅ Auto-approval updated.")
 
@@ -336,7 +384,9 @@ async def apply_warning(chat_id: int, target_user, context: ContextTypes.DEFAULT
             await context.bot.restrict_chat_member(chat_id, target_user.id, permissions=ChatPermissions(can_send_messages=False))
             warnings[chat_id][target_user.id] = 0
             return f"🔇 {target_user.first_name} ko mute kar diya gaya."
-        except: return "⚠️ Mute failed."
+        except Exception as e:
+            log.error(f"apply_warning mute failed: {repr(e)}")
+            return "⚠️ Mute failed."
     return f"⚠️ {target_user.first_name} warned ({count}/{MAX_WARNINGS})."
 
 async def warn_user(update, context):
@@ -347,7 +397,7 @@ async def warn_user(update, context):
 async def unwarn_user(update, context):
     if not await is_group_admin(update, context): return
     target = get_target_user(update)
-    if target: 
+    if target:
         warnings[update.message.chat_id][target.id] = 0
         await update.message.reply_text("✅ Warnings cleared.")
 
@@ -358,7 +408,9 @@ async def mute_user(update, context):
         try:
             await context.bot.restrict_chat_member(update.message.chat_id, target.id, permissions=ChatPermissions(can_send_messages=False))
             await update.message.reply_text(f"🔇 {target.first_name} muted.")
-        except: pass
+        except Exception as e:
+            log.error(f"mute_user failed: {repr(e)}")
+            await update.message.reply_text("⚠️ Mute failed (check bot admin permissions).")
 
 async def unmute_user(update, context):
     if not await is_group_admin(update, context): return
@@ -367,7 +419,9 @@ async def unmute_user(update, context):
         try:
             await context.bot.restrict_chat_member(update.message.chat_id, target.id, permissions=ChatPermissions(can_send_messages=True, can_send_other_messages=True))
             await update.message.reply_text(f"🔊 {target.first_name} unmuted.")
-        except: pass
+        except Exception as e:
+            log.error(f"unmute_user failed: {repr(e)}")
+            await update.message.reply_text("⚠️ Unmute failed (check bot admin permissions).")
 
 async def kick_user(update, context):
     if not await is_group_admin(update, context): return
@@ -377,7 +431,9 @@ async def kick_user(update, context):
             await context.bot.ban_chat_member(update.message.chat_id, target.id)
             await context.bot.unban_chat_member(update.message.chat_id, target.id)
             await update.message.reply_text(f"👋 {target.first_name} kicked.")
-        except: pass
+        except Exception as e:
+            log.error(f"kick_user failed: {repr(e)}")
+            await update.message.reply_text("⚠️ Kick failed (check bot admin permissions).")
 
 async def ban_user(update, context):
     if not await is_group_admin(update, context): return
@@ -386,10 +442,12 @@ async def ban_user(update, context):
         try:
             await context.bot.ban_chat_member(update.message.chat_id, target.id)
             await update.message.reply_text(f"🚫 {target.first_name} banned.")
-        except: pass
+        except Exception as e:
+            log.error(f"ban_user failed: {repr(e)}")
+            await update.message.reply_text("⚠️ Ban failed (check bot admin permissions).")
 
 # ============================================================
-# WELCOME & BOT ADD REWARD 
+# WELCOME & BOT ADD REWARD
 # ============================================================
 async def set_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_group_admin(update, context): return
@@ -398,8 +456,8 @@ async def set_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
-    adder = update.message.from_user 
-    
+    adder = update.message.from_user
+
     for member in update.message.new_chat_members:
         if member.id == context.bot.id:
             if chat_id not in rewarded_groups:
@@ -414,16 +472,18 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             else:
                 await update.message.reply_text("Hello everyone! Main wapas aa gaya. 👋")
             continue
-            
+
         if member.is_bot:
             continue
-            
+
         template = custom_welcome.get(
             chat_id,
             "🎉 Welcome {name}! Glad to have you here.\nType /rules to see the rules."
         )
-        try: await update.message.reply_text(template.replace("{name}", member.first_name))
-        except: pass
+        try:
+            await update.message.reply_text(template.replace("{name}", member.first_name))
+        except Exception as e:
+            log.error(f"welcome_new_member failed: {repr(e)}")
 
 # ============================================================
 # VIRTUAL CURRENCY, PROMO CODES & SHOP
@@ -464,7 +524,7 @@ async def redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args: return
     code = context.args[0].upper()
     promo = promo_codes.get(code)
-    
+
     if not promo:
         await update.message.reply_text("❌ Invalid code.")
         return
@@ -474,7 +534,7 @@ async def redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(promo["used_by"]) >= promo["limit"]:
         await update.message.reply_text("❌ Code limit reached.")
         return
-        
+
     promo["used_by"].add(update.message.from_user.id)
     add_coins(update.message.chat_id, update.message.from_user.id, promo["amount"])
     await update.message.reply_text(f"🎉 Redeemed! You got {promo['amount']} coins.")
@@ -541,9 +601,10 @@ async def generate_trivia_question():
     try:
         def fetch_trivia():
             return nvidia_client.chat.completions.create(
-                model=NVIDIA_MODEL, messages=[{"role": "user", "content": prompt}], max_tokens=200
+                model=NVIDIA_MODEL, messages=[{"role": "user", "content": prompt}],
+                max_tokens=200, timeout=NVIDIA_TIMEOUT_SECONDS
             ).choices[0].message.content
-            
+
         raw = await asyncio.to_thread(fetch_trivia)
         data = {}
         for line in raw.strip().split('\n'):
@@ -554,8 +615,8 @@ async def generate_trivia_question():
             elif line.startswith("D:"): data["D"] = line[2:].strip()
             elif line.startswith("CORRECT:"): data["correct"] = line.split(":")[1].strip().upper()[:1]
         if all(k in data for k in ["question", "A", "B", "C", "D", "correct"]): return data
-    except Exception as e: 
-        log.error(f"Trivia error: {e}")
+    except Exception as e:
+        log.error(f"Trivia error: {repr(e)}")
     return None
 
 async def start_trivia(update, context):
@@ -587,7 +648,7 @@ async def handle_trivia_answer(update, context):
         await update.message.reply_text("❌ Wrong!")
     return True
 
-# TTT
+# TTT (existing 1v1 tic-tac-toe)
 ttt_games = {}
 def render_ttt(b): return InlineKeyboardMarkup([[InlineKeyboardButton({" ":"➕","X":"❌","O":"⭕"}[b[r*3+c]], callback_data=f"ttt_{r*3+c}") for c in range(3)] for r in range(3)])
 def check_ttt(b):
@@ -619,7 +680,7 @@ async def handle_ttt_click(update, context):
         g["turn"] = "O" if g["turn"]=="X" else "X"
         await update.callback_query.edit_message_text(f"Turn: {g['nx'] if g['turn']=='X' else g['no']}", reply_markup=render_ttt(g["board"]))
 
-# Word Chain & Math
+# Word Chain & Math (existing group games)
 math_blitz_sessions = {}
 word_chain_sessions = {}
 
@@ -637,7 +698,8 @@ async def handle_math_blitz_answer(update, context):
             add_coins(update.message.chat_id, update.message.from_user.id, 10)
             await update.message.reply_text("🎉 Correct! Won 10 coins.")
             return True
-    except: pass
+    except Exception:
+        pass
     return False
 
 async def start_word_chain(update, context):
@@ -658,6 +720,243 @@ async def handle_word_chain_answer(update, context):
     return True
 
 # ============================================================
+# NEW MULTIPLAYER GAME 1: ROCK PAPER SCISSORS (1v1, challenge based)
+# ============================================================
+rps_games = {}
+RPS_BEATS = {"rock": "scissors", "paper": "rock", "scissors": "paper"}
+RPS_EMOJI = {"rock": "🪨", "paper": "📄", "scissors": "✂️"}
+
+async def start_rps(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.reply_to_message:
+        await update.message.reply_text("⚠️ Reply to someone's message with `/rps` to challenge them.", parse_mode="Markdown")
+        return
+    p1, p2 = update.message.from_user, update.message.reply_to_message.from_user
+    if p1.id == p2.id or p2.is_bot:
+        await update.message.reply_text("❌ Invalid opponent.")
+        return
+
+    chat_id = update.message.chat_id
+    if chat_id in rps_games and not rps_games[chat_id].get("finished", True):
+        await update.message.reply_text("⚠️ Ek RPS game already chal rahi hai is group mein.")
+        return
+
+    rps_games[chat_id] = {
+        "players": {p1.id: p1.first_name, p2.id: p2.first_name},
+        "choices": {},
+        "finished": False,
+    }
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🪨 Rock", callback_data=f"rps_{chat_id}_rock"),
+        InlineKeyboardButton("📄 Paper", callback_data=f"rps_{chat_id}_paper"),
+        InlineKeyboardButton("✂️ Scissors", callback_data=f"rps_{chat_id}_scissors"),
+    ]])
+    await update.message.reply_text(
+        f"✊ *Rock Paper Scissors!*\n{p1.first_name} vs {p2.first_name}\n\nBoth players, pick your move (private tap):",
+        parse_mode="Markdown", reply_markup=keyboard
+    )
+
+    async def _timeout():
+        await asyncio.sleep(GAME_TIMEOUT_SECONDS)
+        g = rps_games.get(chat_id)
+        if g and not g["finished"]:
+            g["finished"] = True
+            try:
+                await context.bot.send_message(chat_id, "⏰ RPS timed out, game cancelled.")
+            except Exception:
+                pass
+    asyncio.create_task(_timeout())
+
+async def handle_rps_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, chat_id_str, choice = query.data.split("_")
+    chat_id = int(chat_id_str)
+    user = query.from_user
+
+    g = rps_games.get(chat_id)
+    if not g or g["finished"]:
+        await query.answer("Yeh game khatam ho gayi.", show_alert=True)
+        return
+    if user.id not in g["players"]:
+        await query.answer("Yeh game tumhare liye nahi hai.", show_alert=True)
+        return
+    if user.id in g["choices"]:
+        await query.answer("Tum already choose kar chuke ho!", show_alert=True)
+        return
+
+    g["choices"][user.id] = choice
+    await query.answer(f"Tumne {choice} choose kiya ✅")
+
+    if len(g["choices"]) < 2:
+        return
+
+    g["finished"] = True
+    (p1_id, p1_choice), (p2_id, p2_choice) = list(g["choices"].items())
+    p1_name, p2_name = g["players"][p1_id], g["players"][p2_id]
+
+    if p1_choice == p2_choice:
+        result_text = f"🤝 Draw! Dono ne {RPS_EMOJI[p1_choice]} choose kiya."
+    elif RPS_BEATS[p1_choice] == p2_choice:
+        add_coins(chat_id, p1_id, RPS_WIN_COINS)
+        result_text = f"🏆 {p1_name} won! {RPS_EMOJI[p1_choice]} beats {RPS_EMOJI[p2_choice]} (+{RPS_WIN_COINS} coins)"
+    else:
+        add_coins(chat_id, p2_id, RPS_WIN_COINS)
+        result_text = f"🏆 {p2_name} won! {RPS_EMOJI[p2_choice]} beats {RPS_EMOJI[p1_choice]} (+{RPS_WIN_COINS} coins)"
+
+    await query.edit_message_text(
+        f"✊ *Rock Paper Scissors — Result*\n\n"
+        f"{p1_name}: {RPS_EMOJI[p1_choice]}\n{p2_name}: {RPS_EMOJI[p2_choice]}\n\n{result_text}",
+        parse_mode="Markdown"
+    )
+
+# ============================================================
+# NEW MULTIPLAYER GAME 2: TRIVIA RACE (group, button based, first correct wins)
+# ============================================================
+TRIVIA_RACE_QUESTIONS = [
+    {"q": "Capital of Japan kya hai?", "options": ["Seoul", "Tokyo", "Beijing", "Bangkok"], "correct": 1},
+    {"q": "2 + 2 x 2 = ?", "options": ["6", "8", "4", "2"], "correct": 0},
+    {"q": "Sabse bada planet kaunsa hai?", "options": ["Earth", "Mars", "Jupiter", "Saturn"], "correct": 2},
+    {"q": "HTML ka full form?", "options": ["HyperText Markup Language", "High Text Markup Lang", "Home Tool ML", "None"], "correct": 0},
+    {"q": "Python kis type ki language hai?", "options": ["Compiled only", "Interpreted", "Assembly", "Machine code"], "correct": 1},
+    {"q": "Kitne continents hain duniya mein?", "options": ["5", "6", "7", "8"], "correct": 2},
+]
+
+trivia_race_sessions = {}
+
+async def start_trivia_race(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    if chat_id in trivia_race_sessions and not trivia_race_sessions[chat_id].get("finished", True):
+        await update.message.reply_text("⚠️ Trivia race already chal rahi hai.")
+        return
+
+    q = random.choice(TRIVIA_RACE_QUESTIONS)
+    trivia_race_sessions[chat_id] = {"question": q, "finished": False}
+
+    buttons = [[InlineKeyboardButton(opt, callback_data=f"tr_{chat_id}_{i}")] for i, opt in enumerate(q["options"])]
+    await update.message.reply_text(
+        f"⚡ *Trivia Race!* First correct answer wins {TRIVIA_RACE_WIN_COINS} coins.\n\n❓ {q['q']}",
+        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+    async def _timeout():
+        await asyncio.sleep(GAME_TIMEOUT_SECONDS)
+        s = trivia_race_sessions.get(chat_id)
+        if s and not s["finished"]:
+            s["finished"] = True
+            try:
+                await context.bot.send_message(chat_id, "⏰ Trivia race timed out, koi jeeta nahi.")
+            except Exception:
+                pass
+    asyncio.create_task(_timeout())
+
+async def handle_trivia_race_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, chat_id_str, idx_str = query.data.split("_")
+    chat_id, idx = int(chat_id_str), int(idx_str)
+    user = query.from_user
+
+    s = trivia_race_sessions.get(chat_id)
+    if not s or s["finished"]:
+        await query.answer("Yeh race khatam ho gayi.", show_alert=True)
+        return
+
+    if idx == s["question"]["correct"]:
+        s["finished"] = True
+        add_coins(chat_id, user.id, TRIVIA_RACE_WIN_COINS)
+        await query.answer("Correct! 🎉")
+        await query.edit_message_text(
+            f"🏆 *{user.first_name} won the Trivia Race!* +{TRIVIA_RACE_WIN_COINS} coins 🎉\n\n"
+            f"❓ {s['question']['q']}\n✅ Answer: {s['question']['options'][s['question']['correct']]}",
+            parse_mode="Markdown"
+        )
+    else:
+        await query.answer("❌ Galat jawaab, koi aur try kare!", show_alert=True)
+
+# ============================================================
+# NEW MULTIPLAYER GAME 3: MATH DUEL (1v1, challenge based, button answers)
+# ============================================================
+math_duel_games = {}
+
+def _gen_math_duel_problem():
+    a, b = random.randint(2, 20), random.randint(2, 20)
+    op = random.choice(["+", "-", "*"])
+    answer = {"+": a + b, "-": a - b, "*": a * b}[op]
+    return f"{a} {op} {b}", answer
+
+async def start_math_duel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    if not update.message.reply_to_message:
+        await update.message.reply_text("⚠️ Reply to someone's message with `/mathduel` to challenge them.", parse_mode="Markdown")
+        return
+
+    challenger = update.message.from_user
+    target = update.message.reply_to_message.from_user
+    if target.id == challenger.id or target.is_bot:
+        await update.message.reply_text("❌ Invalid opponent.")
+        return
+
+    if chat_id in math_duel_games and not math_duel_games[chat_id].get("finished", True):
+        await update.message.reply_text("⚠️ Math duel already chal rahi hai is group mein.")
+        return
+
+    problem, answer = _gen_math_duel_problem()
+    wrong_answers = set()
+    while len(wrong_answers) < 3:
+        delta = random.choice([-5, -3, -2, -1, 1, 2, 3, 5])
+        wrong = answer + delta
+        if wrong != answer:
+            wrong_answers.add(wrong)
+    options = list(wrong_answers) + [answer]
+    random.shuffle(options)
+
+    math_duel_games[chat_id] = {
+        "answer": answer, "finished": False,
+        "players": {challenger.id: challenger.first_name, target.id: target.first_name}
+    }
+
+    buttons = [[InlineKeyboardButton(str(opt), callback_data=f"md_{chat_id}_{opt}")] for opt in options]
+    await update.message.reply_text(
+        f"🧮 *Math Blitz Duel!*\n{challenger.first_name} vs {target.first_name}\n\n"
+        f"First to answer correctly wins {MATH_DUEL_WIN_COINS} coins.\n\n❓ {problem} = ?",
+        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+    async def _timeout():
+        await asyncio.sleep(GAME_TIMEOUT_SECONDS)
+        g = math_duel_games.get(chat_id)
+        if g and not g["finished"]:
+            g["finished"] = True
+            try:
+                await context.bot.send_message(chat_id, "⏰ Math duel timed out, koi jeeta nahi.")
+            except Exception:
+                pass
+    asyncio.create_task(_timeout())
+
+async def handle_math_duel_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, chat_id_str, val_str = query.data.split("_")
+    chat_id, val = int(chat_id_str), int(val_str)
+    user = query.from_user
+
+    g = math_duel_games.get(chat_id)
+    if not g or g["finished"]:
+        await query.answer("Yeh duel khatam ho gayi.", show_alert=True)
+        return
+    if user.id not in g["players"]:
+        await query.answer("Yeh duel tumhare liye nahi hai.", show_alert=True)
+        return
+
+    if val == g["answer"]:
+        g["finished"] = True
+        add_coins(chat_id, user.id, MATH_DUEL_WIN_COINS)
+        await query.answer("Correct! 🎉")
+        await query.edit_message_text(
+            f"🏆 *{user.first_name} won the Math Duel!* +{MATH_DUEL_WIN_COINS} coins 🎉\n\n✅ Answer was: {g['answer']}",
+            parse_mode="Markdown"
+        )
+    else:
+        await query.answer("❌ Galat! Doosra try kare.", show_alert=True)
+
+# ============================================================
 # MAIN MESSAGE HANDLER
 # ============================================================
 async def check_flood(update, context):
@@ -669,7 +968,8 @@ async def check_flood(update, context):
             message_log[chat_id][uid].clear()
             await update.message.reply_text("🚨 Flooding! Muted.")
             return True
-        except: pass
+        except Exception as e:
+            log.error(f"check_flood mute failed: {repr(e)}")
     return False
 
 async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -701,13 +1001,13 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply = await get_ai_reply(update.message.text, list(chat_history[chat_id]), persona.get(chat_id))
             await update.message.reply_text(reply)
         except Exception as e:
-            log.error(f"AI failed: {e}")
+            log.error(f"AI failed: {repr(e)}")
 
 # ============================================================
 # ERROR HANDLER
 # ============================================================
 async def error_handler(update, context):
-    log.error(f"Error: {context.error}")
+    log.error(f"Error: {repr(context.error)}")
 
 # ============================================================
 # MAIN
@@ -722,7 +1022,16 @@ def main():
     app.add_handler(CommandHandler("testai", test_ai))
     app.add_handler(CommandHandler("adminpanel", admin_panel))
     app.add_handler(CommandHandler("addadmin", add_admin))
+    app.add_handler(CommandHandler("removeadmin", remove_admin))
+    app.add_handler(CommandHandler("listadmins", list_admins))
     app.add_handler(CommandHandler("setwelcome", set_welcome))
+    app.add_handler(CommandHandler("setrules", set_rules))
+    app.add_handler(CommandHandler("rules", show_rules))
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("setpersona", set_persona))
+    app.add_handler(CommandHandler("resetpersona", reset_persona))
+    app.add_handler(CommandHandler("setdelay", set_delay))
+    app.add_handler(CommandHandler("autoapprove", toggle_autoapprove))
     app.add_handler(CommandHandler("balance", balance))
     app.add_handler(CommandHandler("shop", shop))
     app.add_handler(CommandHandler("buy", buy_item))
@@ -731,14 +1040,21 @@ def main():
     app.add_handler(CommandHandler("mybadges", my_badges))
     app.add_handler(CommandHandler("topmembers", top_members))
     app.add_handler(CommandHandler("setbirthday", set_birthday))
+
+    # Existing games
     app.add_handler(CommandHandler("trivia", start_trivia))
     app.add_handler(CommandHandler("tictactoe", start_tictactoe))
     app.add_handler(CommandHandler("mathblitz", start_math_blitz))
     app.add_handler(CommandHandler("wordchain", start_word_chain))
-    
+
+    # New multiplayer games
+    app.add_handler(CommandHandler("rps", start_rps))
+    app.add_handler(CommandHandler("triviarace", start_trivia_race))
+    app.add_handler(CommandHandler("mathduel", start_math_duel))
+
     app.add_handler(CommandHandler("genpromo", gen_promo))
     app.add_handler(CommandHandler("redeem", redeem))
-    
+
     app.add_handler(CommandHandler("mute", mute_user))
     app.add_handler(CommandHandler("unmute", unmute_user))
     app.add_handler(CommandHandler("kick", kick_user))
